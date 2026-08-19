@@ -68,10 +68,16 @@ fn writeBody(
     try writeTools(alloc, w, request);
     try writeReasoning(w, request.provider_options);
 
-    try w.writeAll(
-        ",\"tool_choice\":\"auto\",\"parallel_tool_calls\":true," ++
-            "\"store\":false,\"stream\":true,\"include\":[\"reasoning.encrypted_content\"]}",
-    );
+    // Honor the orchestrator's tool choice: `.none` turns (recovery
+    // reconciliation, first_call_tool_choice=none) must forbid tool calls.
+    const tool_choice = switch (request.tool_choice) {
+        .auto => "auto",
+        .none => "none",
+    };
+    try w.writeAll(",\"tool_choice\":\"");
+    try w.writeAll(tool_choice);
+    try w.writeAll("\",\"parallel_tool_calls\":true," ++
+        "\"store\":false,\"stream\":true,\"include\":[\"reasoning.encrypted_content\"]}");
 }
 
 fn writeInstructions(
@@ -306,6 +312,17 @@ test "responses body translates gateway tools and reasoning effort" {
     try std.testing.expect(std.mem.indexOf(u8, body, "perplexity") == null);
     // minimal normalizes to low.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"low\",\"summary\":\"auto\"}") != null);
+}
+
+test "responses body honors tool_choice none" {
+    const alloc = std.testing.allocator;
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "hi" }};
+    var request = testRequest(&messages, "");
+    request.tool_choice = .none;
+    const body = try buildResponsesRequest(alloc, request);
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"none\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") == null);
 }
 
 test "responses body rejects vision and structured shapes" {

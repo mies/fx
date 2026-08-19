@@ -213,9 +213,10 @@ fn streamCodexCompletion(
     alloc: Allocator,
     request: agent_stream_provider_contract.Request,
 ) anyerror!agent_stream_provider_contract.Result {
-    // The Codex backend requires the ChatGPT account id as a header; it is
-    // carried inside the access-token JWT, so parse it from the credential.
-    const account_id = codex_session.accountId(alloc, request.api_key) catch null;
+    // The Codex backend requires the ChatGPT account id as a header. Resolve
+    // it from the access-token JWT, falling back to the stored session for
+    // imported tokens whose JWT omits the claim.
+    const account_id = codex_session.resolveAccountId(alloc, request.api_key);
     defer if (account_id) |id| alloc.free(id);
 
     const result = gateway_client.streamCodexResponses(

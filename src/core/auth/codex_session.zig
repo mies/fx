@@ -165,6 +165,17 @@ pub fn accountId(alloc: Allocator, access_token: []const u8) Error![]u8 {
     return facts.account_id;
 }
 
+/// Resolves the account id for a live request: the access-token JWT claim
+/// first, then the stored session's saved account id (import sources may keep
+/// it only in the file, not the JWT). Owned by caller; null if unresolvable.
+pub fn resolveAccountId(alloc: Allocator, access_token: []const u8) ?[]u8 {
+    if (accountId(alloc, access_token)) |id| return id else |_| {}
+    var session = (load(alloc) catch null) orelse return null;
+    defer session.deinit(alloc);
+    if (session.account_id.len == 0) return null;
+    return alloc.dupe(u8, session.account_id) catch null;
+}
+
 // --- fx storage (~/.fx/codex-auth.json) ------------------------------------
 
 pub fn load(alloc: Allocator) Error!?Session {
@@ -286,6 +297,10 @@ pub fn refresh(alloc: Allocator, transport: oauth_transport.Provider, session: *
 pub fn loadValid(alloc: Allocator, transport: oauth_transport.Provider) Error!?Session {
     var session = (try load(alloc)) orelse return null;
     if (!session.needsRefresh(io_mod.milliTimestamp())) return session;
+    // refresh() consumes (deinits) `session` on success and returns without
+    // error; on any failure it leaves `session` owned by us, so this errdefer
+    // zeroes and frees the secret tokens rather than leaking them.
+    errdefer session.deinit(alloc);
     return try refresh(alloc, transport, &session);
 }
 

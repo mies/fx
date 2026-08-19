@@ -398,6 +398,10 @@ fn codexProviderCredential(
     return .{
         .token = try alloc.dupe(u8, session.access_token),
         .source = .provider_api_key,
+        // Report the token's expiry so a session kept open past it withholds
+        // the stale token (clean re-login prompt) instead of looping on 401s.
+        // The common case is covered by the startup refresh in loadValid.
+        .refresh_after_ms = session.expires_at_ms,
     };
 }
 
@@ -417,10 +421,12 @@ fn loadOrImportCodexSession(
         },
     }
     // No fx session yet: adopt an existing Codex CLI / pi login if present so
-    // the provider works out of the box for users already signed in.
+    // the provider works out of the box for users already signed in. Persist
+    // the adoption only outside `.stored` (diagnostics) mode, which must not
+    // write to disk — read-only commands like `fx models` use `.stored`.
     if (codex_session.importAny(alloc) catch null) |imported| {
         const owned = imported;
-        codex_session.save(alloc, owned) catch {};
+        if (mode == .refresh_if_needed) codex_session.save(alloc, owned) catch {};
         return owned;
     }
     return null;
