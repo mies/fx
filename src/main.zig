@@ -47,6 +47,7 @@ const builtin_commands = @import("builtins/commands.zig");
 const command_specs = @import("core/slash_commands/command_specs.zig");
 const builtin_context = @import("builtins/context.zig");
 const builtin_devbox = @import("builtins/devbox.zig");
+const builtin_direct = @import("builtins/direct_providers.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
@@ -423,14 +424,13 @@ const App = struct {
     }
 
     pub fn creditsProvider(_: *const Self) gateway_provider.CreditsProvider {
-        return builtin_gateway.credits_provider;
+        return builtin_direct.activeCreditsProvider() orelse builtin_gateway.credits_provider;
     }
 
     pub fn agentStreamProvider(_: *const Self) agent_stream_provider.Provider {
-        return if (comptime host_target.is_wasm)
-            js_host_stream_provider.provider()
-        else
-            builtin_gateway.agent_stream_provider;
+        if (comptime host_target.is_wasm) return js_host_stream_provider.provider();
+        if (builtin_direct.activeAgentStreamProvider()) |provider| return provider;
+        return builtin_gateway.agent_stream_provider;
     }
 
     pub fn cooperativeTransportPulse(self: *Self) !void {
@@ -595,7 +595,7 @@ const App = struct {
         try BootstrapAppRuntime.bootstrap(
             &app,
             footer_rows,
-            builtin_gateway.default_model,
+            builtin_direct.activeDefaultModel() orelse builtin_gateway.default_model,
             default_max_agent_steps,
             handle_sigwinch,
             launch.record_requested,
@@ -1546,7 +1546,13 @@ const App = struct {
     }
 
     pub fn permissionReviewerProvider(_: *const App) ?permission_auto_classifier.Provider {
-        return if (comptime host_profile.tools) builtin_gateway.permission_reviewer.provider else null;
+        if (comptime !host_profile.tools) return null;
+        // The auto-permission reviewer speaks the gateway wire protocol with
+        // a gateway reviewer model; under a direct provider it is disabled so
+        // auto mode falls back to prompting instead of sending doomed
+        // gateway-shaped requests to a third-party host.
+        if (builtin_direct.entryOverrides() != null) return null;
+        return builtin_gateway.permission_reviewer.provider;
     }
 
     pub fn describeToolAction(self: *App, arena: Allocator, call: ToolCall, file_display_path: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
@@ -1681,7 +1687,10 @@ const App = struct {
     pub fn fetchModelIds(self: *App) !std.ArrayList([]u8) {
         return AgentAppRuntime.fetchModelIds(
             self,
-            if (comptime host_target.is_wasm) js_host_model_catalog.provider else builtin_gateway.model_catalog_provider,
+            if (comptime host_target.is_wasm)
+                js_host_model_catalog.provider
+            else
+                builtin_direct.activeModelCatalogProvider() orelse builtin_gateway.model_catalog_provider,
             builtin_gateway.models_path,
         );
     }
@@ -1698,7 +1707,7 @@ const App = struct {
             );
         } else {
             self.model_cache.startWarmup(
-                builtin_gateway.model_catalog_provider,
+                builtin_direct.activeModelCatalogProvider() orelse builtin_gateway.model_catalog_provider,
                 self.auth.modelCatalogAccess(),
             );
         }
@@ -3185,6 +3194,19 @@ test "native app preserves the built-in tool set without workspace metadata" {
 }
 
 fn fullEntryConfig() app_entry_runtime.Config {
+    var cfg = fullGatewayEntryConfig();
+    if (builtin_direct.entryOverrides()) |overrides| {
+        cfg.default_model = overrides.default_model;
+        cfg.gateway_chat_url = overrides.chat_url;
+        cfg.gateway_provider = overrides.provider;
+        // Gateway-protocol auto-permission review is unavailable on a direct
+        // provider; auto mode falls back to prompting.
+        cfg.permission_reviewer_provider = null;
+    }
+    return cfg;
+}
+
+fn fullGatewayEntryConfig() app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
@@ -3221,6 +3243,16 @@ fn fullEntryConfig() app_entry_runtime.Config {
 }
 
 fn localEntryConfig() app_entry_runtime.Config {
+    var cfg = localGatewayEntryConfig();
+    if (builtin_direct.entryOverrides()) |overrides| {
+        cfg.default_model = overrides.default_model;
+        cfg.gateway_chat_url = overrides.chat_url;
+        cfg.gateway_provider = overrides.provider;
+    }
+    return cfg;
+}
+
+fn localGatewayEntryConfig() app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,

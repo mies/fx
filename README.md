@@ -60,6 +60,25 @@ fx ask "explain the changes in this repository"
 
 fx starts in `auto` permission mode, which reviews unresolved sensitive actions. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
 
+### Direct providers (experimental)
+
+fx can talk to an OpenAI-compatible provider directly instead of the Vercel AI Gateway. Set `FX_PROVIDER` to exactly `zai` (Z.AI GLM Coding Plan) or `opencode` (OpenCode Go), and provide that provider's API key through its environment variable:
+
+```bash
+FX_PROVIDER=zai ZAI_API_KEY=your-key fx
+FX_PROVIDER=opencode OPENCODE_API_KEY=your-key fx ask "explain this repo"
+```
+
+Keys can also live in `~/.fx/provider-keys.json` (the environment variable wins when both are set). The file must be valid JSON and private, or fx treats it as absent:
+
+```bash
+printf '{"opencode":"your-key"}' > ~/.fx/provider-keys.json
+chmod 600 ~/.fx/provider-keys.json
+FX_PROVIDER=opencode fx
+```
+
+Any other `FX_PROVIDER` value falls back to the gateway. While a direct provider is active, gateway-only features degrade gracefully: web search, vision, credits, usage reconciliation, and automatic permission review are unavailable, and auto permission mode prompts instead of reviewing. `fx login` and gateway API keys are ignored for streaming while `FX_PROVIDER` is set.
+
 Inside a saved session, `/permissions remember <allow|deny> <tool-name> <arguments-json>` stores an exact confirmed rule without running the action. `/permissions` lists stable rule IDs, and `/permissions revoke <rule-id>` removes a stored rule even when its original workspace or file state has changed.
 
 ## Embed fx

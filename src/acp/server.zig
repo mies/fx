@@ -1,6 +1,7 @@
 const std = @import("std");
 const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
+const provider_selection = @import("../core/config/provider_selection.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
 const jsonrpc = @import("jsonrpc.zig");
@@ -294,10 +295,14 @@ pub fn releaseActiveSession(state: *ServerState) !void {
         active.session_rt.usage.cancelReconciliation();
         active.session_rt.usage.finishProfilePublicationsBeforeShutdown();
         flushActiveSessionUsage(state) catch |err| {
-            active.session_rt.usage.startReconciliation(
-                state.alloc,
-                state.api_key,
-            );
+            // Reconciliation targets the Vercel generation endpoint; skip it
+            // when the process credential belongs to a direct provider.
+            if (provider_selection.active() == .gateway) {
+                active.session_rt.usage.startReconciliation(
+                    state.alloc,
+                    state.api_key,
+                );
+            }
             return err;
         };
         active.session_rt.usage.configurePublicationSink(null);

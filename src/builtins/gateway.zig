@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 pub const permission_reviewer = @import("gateway/permission_reviewer.zig");
 
 const api_key_validator_contract = @import("../core/auth/api_key_validator.zig");
+const direct_providers = @import("direct_providers.zig");
 const agent_stream_provider_contract = @import("../core/agent/stream_provider.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const oauth_transport = @import("../core/auth/oauth_transport.zig");
@@ -713,6 +714,9 @@ pub fn chatUrl(fallback: []const u8) []const u8 {
 }
 
 pub fn defaultChatUrl() []const u8 {
+    // A direct provider (FX_PROVIDER) replaces the gateway chat endpoint for
+    // the whole process; see builtins/direct_providers.zig.
+    if (direct_providers.activeChatUrl()) |url| return url;
     return chatUrl(default_chat_url);
 }
 

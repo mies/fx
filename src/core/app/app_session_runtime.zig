@@ -1561,12 +1561,14 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn startResumedSessionReconciliation(app: *App) void {
             if (comptime @hasField(App, "auth")) {
-                if (app.auth.apiKey()) |api_key| {
-                    app.session.usage.startReconciliation(
-                        app.alloc,
-                        api_key,
-                    );
-                }
+                // Reconciliation looks up pending generations at the Vercel
+                // generation endpoint; a direct-provider key never goes there.
+                const credential = app.auth.gatewayCredential() orelse return;
+                if (credential.source == .provider_api_key) return;
+                app.session.usage.startReconciliation(
+                    app.alloc,
+                    credential.api_key,
+                );
             }
         }
 

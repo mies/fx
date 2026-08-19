@@ -7,6 +7,8 @@ const credentials = @import("../auth/credentials.zig");
 const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const input_appearance = @import("../config/input_appearance.zig");
+const provider_key_file = @import("../auth/provider_key_file.zig");
+const provider_selection = @import("../config/provider_selection.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const record_tape = @import("../workspace/record_tape.zig");
@@ -360,6 +362,25 @@ fn loadStartupStateForWorkspace(alloc: Allocator, workspace_root: []const u8, de
 
 const CredentialLoadMode = credentials.LoadMode;
 
+fn directProviderCredential(alloc: Allocator) !?credentials.Credential {
+    const kind = provider_selection.active();
+    const env_name = provider_selection.apiKeyEnvVar(kind) orelse return null;
+    if (io_mod.getenv(env_name)) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len > 0) return .{
+            .token = try alloc.dupe(u8, trimmed),
+            .source = .provider_api_key,
+        };
+    }
+    if (try provider_key_file.load(alloc, kind)) |key| {
+        return .{
+            .token = key,
+            .source = .provider_api_key,
+        };
+    }
+    return null;
+}
+
 fn loadStartupStateFromOwnedWorkspace(
     alloc: Allocator,
     transport: oauth_transport.Provider,
@@ -399,9 +420,17 @@ fn loadStartupStateFromOwnedWorkspace(
     state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
     if (credential_mode) |mode| {
-        const resolution = try credentials.resolvePreferring(alloc, transport, secret_store, mode, settings.credential_source);
-        state.credential = resolution.credential;
-        state.stored_key_status = resolution.stored_key_status;
+        if (provider_selection.active() != .gateway) {
+            // A direct provider (FX_PROVIDER) authenticates with its own API
+            // key environment variable; the gateway credential walk does not
+            // apply. A missing key leaves the credential unset so the
+            // existing missing-credential surfaces report it.
+            state.credential = try directProviderCredential(alloc);
+        } else {
+            const resolution = try credentials.resolvePreferring(alloc, transport, secret_store, mode, settings.credential_source);
+            state.credential = resolution.credential;
+            state.stored_key_status = resolution.stored_key_status;
+        }
     }
     state.permission_mode = loadPermissionMode(settings.permission_mode);
     state.yolo_acknowledged = settings.yolo_acknowledged orelse false;

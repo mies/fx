@@ -118,6 +118,12 @@ pub const GatewayObservation = struct {
         else if (status == .ok)
             if (!completion.generation_metadata_invalid and generation_id != null)
                 .observed_generation
+            else if (!completion.generation_metadata_invalid and origin.len == 0)
+                // No reconciliation origin means the provider carries no
+                // gateway generation identity by design (direct providers,
+                // JS-host transports); the call settles without a billing
+                // incident.
+                .unbilled
             else
                 .possibly_billed_without_identity
         else

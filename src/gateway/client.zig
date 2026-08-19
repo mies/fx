@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const secret = @import("../core/auth/secret.zig");
+const openai_compat = @import("openai_compat.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -760,9 +761,18 @@ const RequestOpenOverride = struct {
     ) anyerror!std.http.Client.Request,
 };
 
+/// Wire protocol spoken on the streaming chat connection. The gateway keeps
+/// its AI SDK language-model protocol; direct providers speak OpenAI
+/// chat/completions over the same hardened connection loop.
+pub const StreamProtocol = enum {
+    gateway,
+    openai_chat,
+};
+
 const StreamCoreOptions = struct {
     setup_timing: ConnectionSetupTiming = .{},
     request_open_override: ?RequestOpenOverride = null,
+    protocol: StreamProtocol = .gateway,
 };
 
 const RequestOpenOperation = struct {
@@ -1027,6 +1037,280 @@ pub fn streamGatewayCompletion(
     );
 }
 
+/// Streams one OpenAI-compatible chat/completions request over the shared
+/// hardened connection loop. Used by direct providers (z.ai, OpenCode); the
+/// gateway path stays on `streamGatewayCompletion`.
+pub fn streamOpenAiChatCompletion(
+    alloc: std.mem.Allocator,
+    request: StreamRequest,
+    callback_ctx: *anyopaque,
+    on_content_chunk: StreamCallback,
+    on_tool_start: ?ToolStartCallback,
+    cancel_flag: *std.atomic.Value(bool),
+) !StreamResult {
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    return streamGatewayCompletionCoreWithOptions(
+        alloc,
+        request,
+        callback_ctx,
+        on_content_chunk,
+        on_tool_start,
+        cancel_flag,
+        null,
+        true,
+        .{ .protocol = .openai_chat },
+    );
+}
+
+const OpenAiToolAccumulator = struct {
+    index: u64,
+    id: std.ArrayList(u8) = .empty,
+    name: std.ArrayList(u8) = .empty,
+    arguments: std.ArrayList(u8) = .empty,
+    announced: bool = false,
+
+    fn deinit(self: *OpenAiToolAccumulator, alloc: std.mem.Allocator) void {
+        self.id.deinit(alloc);
+        self.name.deinit(alloc);
+        self.arguments.deinit(alloc);
+    }
+};
+
+fn consumeOpenAiChatSse(
+    alloc: std.mem.Allocator,
+    reader: anytype,
+    callback_ctx: *anyopaque,
+    on_content_chunk: StreamCallback,
+    on_tool_start: ?ToolStartCallback,
+    on_reasoning_chunk: ?StreamCallback,
+    on_tool_input_chunk: ?StreamCallback,
+    cancel_flag: *std.atomic.Value(bool),
+    content_capture_limit: ?usize,
+) !types.GatewayCompletion {
+    var content_buf: std.ArrayList(u8) = .empty;
+    defer content_buf.deinit(alloc);
+    var accumulators: std.ArrayList(OpenAiToolAccumulator) = .empty;
+    defer {
+        for (accumulators.items) |*acc| acc.deinit(alloc);
+        accumulators.deinit(alloc);
+    }
+    var finish_reason: ?types.ProviderFinishReason = null;
+    var usage: types.Usage = .{};
+
+    var event_reader = SseEventReader{ .max_line_bytes = max_sse_event_line_bytes };
+    defer event_reader.deinit(alloc);
+
+    while (true) {
+        if (cancel_flag.load(.seq_cst)) break;
+
+        const event = try event_reader.next(alloc, reader);
+        defer event_reader.releaseLine();
+
+        const json_text = switch (event) {
+            .data => |json_text| json_text,
+            .done => break,
+            .ignored => continue,
+            .read_failed => {
+                if (cancel_flag.load(.seq_cst)) break;
+                return error.ReadFailed;
+            },
+            .eof => break,
+        };
+
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            traceMalformedSseEvent(json_text.len);
+            continue;
+        };
+        defer parsed.deinit();
+        const root = parsed.value;
+        if (root != .object) continue;
+
+        if (root.object.get("usage")) |usage_val| {
+            if (usage_val == .object) {
+                if (jsonUnsignedField(usage_val.object.get("prompt_tokens"))) |value| {
+                    usage.input_tokens = value;
+                }
+                if (jsonUnsignedField(usage_val.object.get("completion_tokens"))) |value| {
+                    usage.output_tokens = value;
+                }
+            }
+        }
+
+        const choices = root.object.get("choices") orelse continue;
+        if (choices != .array or choices.array.items.len == 0) continue;
+        const choice = choices.array.items[0];
+        if (choice != .object) continue;
+
+        if (choice.object.get("finish_reason")) |reason_val| {
+            if (reason_val == .string) {
+                finish_reason = openai_compat.finishReasonFromOpenAi(reason_val.string);
+            }
+        }
+
+        const delta = choice.object.get("delta") orelse continue;
+        if (delta != .object) continue;
+
+        if (delta.object.get("content")) |content_val| {
+            if (content_val == .string and content_val.string.len > 0) {
+                on_content_chunk(callback_ctx, content_val.string);
+                try appendCappedOpenAiContent(alloc, &content_buf, content_val.string, content_capture_limit);
+            }
+        }
+
+        const reasoning_val = delta.object.get("reasoning_content") orelse delta.object.get("reasoning");
+        if (reasoning_val) |value| {
+            if (value == .string and value.string.len > 0) {
+                if (on_reasoning_chunk) |callback| callback(callback_ctx, value.string);
+            }
+        }
+
+        if (delta.object.get("tool_calls")) |calls_val| {
+            if (calls_val == .array) {
+                for (calls_val.array.items) |fragment| {
+                    try applyOpenAiToolFragment(
+                        alloc,
+                        &accumulators,
+                        fragment,
+                        callback_ctx,
+                        on_tool_start,
+                        on_tool_input_chunk,
+                    );
+                }
+            }
+        }
+    }
+
+    var tool_calls: std.ArrayList(types.ToolCall) = .empty;
+    errdefer {
+        for (tool_calls.items) |call| types.freeToolCall(alloc, call);
+        tool_calls.deinit(alloc);
+    }
+    for (accumulators.items) |*acc| {
+        const id = if (acc.id.items.len > 0)
+            try alloc.dupe(u8, acc.id.items)
+        else
+            try std.fmt.allocPrint(alloc, "call_{d}", .{acc.index});
+        errdefer alloc.free(id);
+        const name = try alloc.dupe(u8, acc.name.items);
+        errdefer alloc.free(name);
+        const arguments = if (acc.arguments.items.len > 0)
+            try alloc.dupe(u8, acc.arguments.items)
+        else
+            try alloc.dupe(u8, "{}");
+        errdefer alloc.free(arguments);
+        try tool_calls.append(alloc, .{
+            .id = id,
+            .name = name,
+            .arguments_json = arguments,
+            .argument_integrity = try types.ToolArgumentIntegrity.classifySerialized(alloc, arguments),
+        });
+    }
+
+    var completion = types.GatewayCompletion{ .usage = usage };
+    completion.tool_calls = try tool_calls.toOwnedSlice(alloc);
+    if (content_buf.items.len > 0) {
+        completion.content = content_buf.toOwnedSlice(alloc) catch |err| {
+            types.freeToolCallSlice(alloc, @constCast(completion.tool_calls));
+            return err;
+        };
+    }
+    // Some OpenAI-compatible backends omit finish_reason or send "stop"
+    // despite streaming tool calls. Normalize to .tool_calls only when every
+    // assembled call carries structurally valid arguments; a mid-argument
+    // truncation keeps finish_reason null so the completion classifies as
+    // interrupted and the recovery path runs.
+    if (completion.tool_calls.len > 0 and
+        (finish_reason == null or finish_reason == .stop) and
+        allToolArgumentsValid(completion.tool_calls))
+    {
+        finish_reason = .tool_calls;
+    }
+    completion.finish_reason = finish_reason;
+    return completion;
+}
+
+fn allToolArgumentsValid(calls: []const types.ToolCall) bool {
+    for (calls) |call| {
+        if (call.argument_integrity != .valid) return false;
+    }
+    return true;
+}
+
+fn jsonUnsignedField(value: ?std.json.Value) ?u64 {
+    const present = value orelse return null;
+    if (present != .integer or present.integer < 0) return null;
+    return @intCast(present.integer);
+}
+
+fn appendCappedOpenAiContent(
+    alloc: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    chunk: []const u8,
+    limit: ?usize,
+) !void {
+    const cap = limit orelse {
+        try buf.appendSlice(alloc, chunk);
+        return;
+    };
+    if (buf.items.len >= cap) return;
+    const remaining = cap - buf.items.len;
+    try buf.appendSlice(alloc, chunk[0..@min(chunk.len, remaining)]);
+}
+
+fn applyOpenAiToolFragment(
+    alloc: std.mem.Allocator,
+    accumulators: *std.ArrayList(OpenAiToolAccumulator),
+    fragment: std.json.Value,
+    callback_ctx: *anyopaque,
+    on_tool_start: ?ToolStartCallback,
+    on_tool_input_chunk: ?StreamCallback,
+) !void {
+    if (fragment != .object) return;
+    const index = jsonUnsignedField(fragment.object.get("index")) orelse 0;
+
+    var slot: ?usize = null;
+    for (accumulators.items, 0..) |acc, i| {
+        if (acc.index == index) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == null) {
+        try accumulators.append(alloc, .{ .index = index });
+        slot = accumulators.items.len - 1;
+    }
+    const acc = &accumulators.items[slot.?];
+
+    // Set-once semantics: the OpenAI contract sends id and name only on a
+    // call's first fragment, but some compatible backends resend them on
+    // every delta; appending would corrupt the identity.
+    if (fragment.object.get("id")) |id_val| {
+        if (id_val == .string and acc.id.items.len == 0) {
+            try acc.id.appendSlice(alloc, id_val.string);
+        }
+    }
+    if (fragment.object.get("function")) |function_val| {
+        if (function_val == .object) {
+            if (function_val.object.get("name")) |name_val| {
+                if (name_val == .string and acc.name.items.len == 0) {
+                    try acc.name.appendSlice(alloc, name_val.string);
+                }
+            }
+            if (function_val.object.get("arguments")) |args_val| {
+                if (args_val == .string and args_val.string.len > 0) {
+                    try acc.arguments.appendSlice(alloc, args_val.string);
+                    if (on_tool_input_chunk) |callback| callback(callback_ctx, args_val.string);
+                }
+            }
+        }
+    }
+    if (!acc.announced and acc.name.items.len > 0) {
+        acc.announced = true;
+        if (on_tool_start) |callback| callback(callback_ctx, acc.id.items, acc.name.items, null);
+    }
+}
+
 fn expectedProviderToolName(alloc: std.mem.Allocator, payload: []const u8) !?[]const u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
     defer parsed.deinit();
@@ -1054,6 +1338,248 @@ fn expectedProviderToolName(alloc: std.mem.Allocator, payload: []const u8) !?[]c
         }
     }
     return null;
+}
+
+const OpenAiSseCapture = struct {
+    content: std.ArrayList(u8) = .empty,
+    reasoning: std.ArrayList(u8) = .empty,
+    tool_inputs: std.ArrayList(u8) = .empty,
+    started_id: std.ArrayList(u8) = .empty,
+    started_name: std.ArrayList(u8) = .empty,
+    failed: bool = false,
+
+    fn deinit(self: *OpenAiSseCapture) void {
+        self.content.deinit(std.testing.allocator);
+        self.reasoning.deinit(std.testing.allocator);
+        self.tool_inputs.deinit(std.testing.allocator);
+        self.started_id.deinit(std.testing.allocator);
+        self.started_name.deinit(std.testing.allocator);
+    }
+
+    fn onContent(raw: *anyopaque, chunk: []const u8) void {
+        const self: *OpenAiSseCapture = @ptrCast(@alignCast(raw));
+        self.content.appendSlice(std.testing.allocator, chunk) catch {
+            self.failed = true;
+        };
+    }
+
+    fn onReasoning(raw: *anyopaque, chunk: []const u8) void {
+        const self: *OpenAiSseCapture = @ptrCast(@alignCast(raw));
+        self.reasoning.appendSlice(std.testing.allocator, chunk) catch {
+            self.failed = true;
+        };
+    }
+
+    fn onToolInput(raw: *anyopaque, chunk: []const u8) void {
+        const self: *OpenAiSseCapture = @ptrCast(@alignCast(raw));
+        self.tool_inputs.appendSlice(std.testing.allocator, chunk) catch {
+            self.failed = true;
+        };
+    }
+
+    fn onToolStart(raw: *anyopaque, tool_id: []const u8, tool_name: []const u8, label: ?[]const u8) void {
+        _ = label;
+        const self: *OpenAiSseCapture = @ptrCast(@alignCast(raw));
+        self.started_id.appendSlice(std.testing.allocator, tool_id) catch {
+            self.failed = true;
+        };
+        self.started_name.appendSlice(std.testing.allocator, tool_name) catch {
+            self.failed = true;
+        };
+    }
+};
+
+test "consumeOpenAiChatSse assembles content, finish reason, and usage" {
+    const alloc = std.testing.allocator;
+    const payload =
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5}}\n\n" ++
+        "data: [DONE]\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var capture: OpenAiSseCapture = .{};
+    defer capture.deinit();
+    var cancelled = std.atomic.Value(bool).init(false);
+
+    var completion = try consumeOpenAiChatSse(
+        alloc,
+        &reader,
+        &capture,
+        OpenAiSseCapture.onContent,
+        OpenAiSseCapture.onToolStart,
+        OpenAiSseCapture.onReasoning,
+        OpenAiSseCapture.onToolInput,
+        &cancelled,
+        null,
+    );
+    defer deinitGatewayCompletion(alloc, &completion);
+
+    try std.testing.expect(!capture.failed);
+    try std.testing.expectEqualStrings("Hello", completion.content.?);
+    try std.testing.expectEqualStrings("Hello", capture.content.items);
+    try std.testing.expectEqualStrings("thinking", capture.reasoning.items);
+    try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
+    try std.testing.expectEqual(@as(?u64, 12), completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 5), completion.usage.output_tokens);
+    try std.testing.expectEqual(@as(usize, 0), completion.tool_calls.len);
+}
+
+test "consumeOpenAiChatSse assembles fragmented tool calls" {
+    const alloc = std.testing.allocator;
+    const payload =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\"," ++
+        "\"type\":\"function\",\"function\":{\"name\":\"list_files\",\"arguments\":\"\"}}]}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\" \\\".\\\"}\"}}]}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" ++
+        "data: [DONE]\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var capture: OpenAiSseCapture = .{};
+    defer capture.deinit();
+    var cancelled = std.atomic.Value(bool).init(false);
+
+    var completion = try consumeOpenAiChatSse(
+        alloc,
+        &reader,
+        &capture,
+        OpenAiSseCapture.onContent,
+        OpenAiSseCapture.onToolStart,
+        OpenAiSseCapture.onReasoning,
+        OpenAiSseCapture.onToolInput,
+        &cancelled,
+        null,
+    );
+    defer deinitGatewayCompletion(alloc, &completion);
+
+    try std.testing.expect(!capture.failed);
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", completion.tool_calls[0].id);
+    try std.testing.expectEqualStrings("list_files", completion.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"path\": \".\"}", completion.tool_calls[0].arguments_json);
+    try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, completion.tool_calls[0].argument_integrity);
+    try std.testing.expectEqualStrings("call_1", capture.started_id.items);
+    try std.testing.expectEqualStrings("list_files", capture.started_name.items);
+    try std.testing.expectEqualStrings("{\"path\": \".\"}", capture.tool_inputs.items);
+    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
+}
+
+test "consumeOpenAiChatSse tolerates eof without done and empty arguments" {
+    const alloc = std.testing.allocator;
+    const payload =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":2,\"function\":{\"name\":\"noop\"}}]}}]}\n\n" ++
+        ": keep-alive comment\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var capture: OpenAiSseCapture = .{};
+    defer capture.deinit();
+    var cancelled = std.atomic.Value(bool).init(false);
+
+    var completion = try consumeOpenAiChatSse(
+        alloc,
+        &reader,
+        &capture,
+        OpenAiSseCapture.onContent,
+        null,
+        null,
+        null,
+        &cancelled,
+        null,
+    );
+    defer deinitGatewayCompletion(alloc, &completion);
+
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("call_2", completion.tool_calls[0].id);
+    try std.testing.expectEqualStrings("{}", completion.tool_calls[0].arguments_json);
+    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
+    try std.testing.expect(completion.content == null);
+}
+
+test "consumeOpenAiChatSse tolerates spaceless data prefixes and repeated ids" {
+    const alloc = std.testing.allocator;
+    const payload =
+        "data:{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\"," ++
+        "\"function\":{\"name\":\"list_files\",\"arguments\":\"{}\"}}]}}]}\n\n" ++
+        "data:{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\"," ++
+        "\"function\":{\"name\":\"list_files\"}}]},\"finish_reason\":\"stop\"}]}\n\n" ++
+        "data:[DONE]\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var capture: OpenAiSseCapture = .{};
+    defer capture.deinit();
+    var cancelled = std.atomic.Value(bool).init(false);
+
+    var completion = try consumeOpenAiChatSse(
+        alloc,
+        &reader,
+        &capture,
+        OpenAiSseCapture.onContent,
+        null,
+        null,
+        null,
+        &cancelled,
+        null,
+    );
+    defer deinitGatewayCompletion(alloc, &completion);
+
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", completion.tool_calls[0].id);
+    try std.testing.expectEqualStrings("list_files", completion.tool_calls[0].name);
+    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
+}
+
+test "consumeOpenAiChatSse keeps truncated tool arguments interruptible" {
+    const alloc = std.testing.allocator;
+    const payload =
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\"," ++
+        "\"function\":{\"name\":\"list_files\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var capture: OpenAiSseCapture = .{};
+    defer capture.deinit();
+    var cancelled = std.atomic.Value(bool).init(false);
+
+    var completion = try consumeOpenAiChatSse(
+        alloc,
+        &reader,
+        &capture,
+        OpenAiSseCapture.onContent,
+        null,
+        null,
+        null,
+        &cancelled,
+        null,
+    );
+    defer deinitGatewayCompletion(alloc, &completion);
+
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+    try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, completion.tool_calls[0].argument_integrity);
+    try std.testing.expect(completion.finish_reason == null);
+}
+
+test "consumeOpenAiChatSse caps captured content at the limit" {
+    const alloc = std.testing.allocator;
+    const payload =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"abcdef\"}}]}\n\n" ++
+        "data: [DONE]\n\n";
+    var reader = std.Io.Reader.fixed(payload);
+    var capture: OpenAiSseCapture = .{};
+    defer capture.deinit();
+    var cancelled = std.atomic.Value(bool).init(false);
+
+    var completion = try consumeOpenAiChatSse(
+        alloc,
+        &reader,
+        &capture,
+        OpenAiSseCapture.onContent,
+        null,
+        null,
+        null,
+        &cancelled,
+        4,
+    );
+    defer deinitGatewayCompletion(alloc, &completion);
+
+    try std.testing.expectEqualStrings("abcd", completion.content.?);
+    try std.testing.expectEqualStrings("abcdef", capture.content.items);
 }
 
 test "expected provider tool name only trusts advertised provider schemas" {
@@ -1178,12 +1704,18 @@ fn streamGatewayCompletionCoreWithOptions(
     defer alloc.free(auth_header);
 
     var extra_headers_buf: [9]std.http.Header = undefined;
-    const extra_headers = gatewayExtraHeaders(
-        &extra_headers_buf,
-        model,
-        request.team,
-        request.session_id,
-    );
+    const extra_headers = switch (core_options.protocol) {
+        .gateway => gatewayExtraHeaders(
+            &extra_headers_buf,
+            model,
+            request.team,
+            request.session_id,
+        ),
+        // OpenAI-compatible endpoints receive only Authorization,
+        // content-type, and user-agent; gateway routing headers would leak
+        // request identity to a third-party host.
+        .openai_chat => extra_headers_buf[0..0],
+    };
 
     var attempt: usize = 0;
     var delivery_ambiguous = false;
@@ -1387,19 +1919,32 @@ fn streamGatewayCompletionCoreWithOptions(
         var transfer_buf: [gateway_transfer_buffer_bytes]u8 = undefined;
         const body_reader = response.reader(&transfer_buf);
         debug_trace.eventf("gateway", "before_sse_consume", trace_ctx, "attempt={d}", .{attempt + 1});
-        var completion = consumeSseStreamTraced(
-            alloc,
-            body_reader,
-            callback_ctx,
-            on_content_chunk,
-            on_tool_start,
-            request.on_reasoning_chunk,
-            request.on_tool_input_chunk,
-            cancel_flag,
-            .{ .requested_model = model, .ctx = trace_ctx },
-            expected_provider_tool_name,
-            request.content_capture_limit,
-        ) catch |err| {
+        var completion = (switch (core_options.protocol) {
+            .gateway => consumeSseStreamTraced(
+                alloc,
+                body_reader,
+                callback_ctx,
+                on_content_chunk,
+                on_tool_start,
+                request.on_reasoning_chunk,
+                request.on_tool_input_chunk,
+                cancel_flag,
+                .{ .requested_model = model, .ctx = trace_ctx },
+                expected_provider_tool_name,
+                request.content_capture_limit,
+            ),
+            .openai_chat => consumeOpenAiChatSse(
+                alloc,
+                body_reader,
+                callback_ctx,
+                on_content_chunk,
+                on_tool_start,
+                request.on_reasoning_chunk,
+                request.on_tool_input_chunk,
+                cancel_flag,
+                request.content_capture_limit,
+            ),
+        }) catch |err| {
             debug_trace.eventf("gateway", "sse_consume_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
             return @as(anyerror!StreamResult, connectedIoFailure(
                 cancel_flag.load(.seq_cst),
@@ -2641,10 +3186,13 @@ const SseEventReader = struct {
 
         if (std.mem.eql(u8, trimmed, "DONE")) return .done;
 
-        const data_prefix = "data: ";
+        const data_prefix = "data:";
         if (!std.mem.startsWith(u8, trimmed, data_prefix)) return .ignored;
 
-        const json_text = trimmed[data_prefix.len..];
+        // Per the SSE spec, at most one leading space after the field colon
+        // belongs to the framing, not the value.
+        var json_text = trimmed[data_prefix.len..];
+        if (json_text.len > 0 and json_text[0] == ' ') json_text = json_text[1..];
         if (std.mem.eql(u8, json_text, "[DONE]")) return .done;
         return .{ .data = json_text };
     }

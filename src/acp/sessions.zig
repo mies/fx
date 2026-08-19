@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../core/shared/io.zig");
+const provider_selection = @import("../core/config/provider_selection.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
@@ -754,10 +755,14 @@ fn activateSession(
     };
     server.enableSubagentHost(state);
     state.active_session.?.session_rt.attachProfileUsagePublisher(state.alloc);
-    state.active_session.?.session_rt.usage.startReconciliation(
-        state.alloc,
-        state.api_key,
-    );
+    // Reconciliation targets the Vercel generation endpoint; skip it when the
+    // process credential belongs to a direct provider.
+    if (provider_selection.active() == .gateway) {
+        state.active_session.?.session_rt.usage.startReconciliation(
+            state.alloc,
+            state.api_key,
+        );
+    }
     activateManagedBackground(state, store);
 }
 

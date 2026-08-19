@@ -4,6 +4,8 @@ const credentials = @import("credentials.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("login_flow.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const provider_key_file = @import("provider_key_file.zig");
+const provider_selection = @import("../config/provider_selection.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -353,7 +355,7 @@ pub const PickerView = struct {
                 }
                 break :blk count;
             },
-            .switch_credential => self.available_sources.count() + 1,
+            .switch_credential => selectableSourceCount(self.available_sources) + 1,
         };
     }
 
@@ -382,9 +384,9 @@ pub const PickerView = struct {
                 }
                 break :blk null;
             },
-            .switch_credential => if (index < self.available_sources.count())
+            .switch_credential => if (index < selectableSourceCount(self.available_sources))
                 .{ .source = sourceAtIndex(self.available_sources, index).? }
-            else if (index == self.available_sources.count())
+            else if (index == selectableSourceCount(self.available_sources))
                 .{ .action = .automatic }
             else
                 null,
@@ -495,6 +497,8 @@ pub const StatusSnapshot = struct {
 
     pub fn missingHelp(self: StatusSnapshot, surface: MissingHelpSurface) ?[]const u8 {
         if (self.active_source != null) return null;
+        const active_provider = provider_selection.active();
+        if (active_provider != .gateway) return provider_selection.missingKeyMessage(active_provider);
         if (self.stored_key_status == .unavailable) return credentials.unreadable_store_message;
         return switch (surface) {
             .cli => credentials.missing_credential_message,
@@ -522,6 +526,23 @@ pub fn loadStatusSnapshot(
     secret_store: host.SecretStore,
     preferred: ?credentials.Source,
 ) !StatusSnapshot {
+    // A direct provider (FX_PROVIDER) authenticates with its own key
+    // environment variable; the gateway credential walk does not describe it.
+    const active_provider = provider_selection.active();
+    if (active_provider != .gateway) {
+        if (provider_selection.apiKeyEnvVar(active_provider)) |env_name| {
+            if (io_mod.getenv(env_name)) |raw| {
+                if (std.mem.trim(u8, raw, " \t\r\n").len > 0) {
+                    return .{ .active_source = .provider_api_key };
+                }
+            }
+        }
+        if (try provider_key_file.load(alloc, active_provider)) |key| {
+            secret.zeroAndFree(alloc, key);
+            return .{ .active_source = .provider_api_key };
+        }
+        return .{};
+    }
     // Resolves in `.stored` mode: a diagnostic must not refresh, because refreshing
     // rewrites the session file and performs network I/O. It reports the expired state
     // instead of repairing it.
@@ -633,6 +654,13 @@ pub const Runtime = struct {
     fn gatewayCredentialAt(self: *const Self, now_ms: i64) ?GatewayCredential {
         const credential = self.selected_credential orelse return null;
         if (credential.needsRefreshAt(now_ms)) return null;
+        // Provider/credential coherence: a direct provider streams only its
+        // own key, and gateway sources never leak to a direct provider host
+        // (nor a direct key to the gateway) even after /login or a
+        // credential switch mid-session.
+        const direct_active = provider_selection.active() != .gateway;
+        const direct_source = credential.source == .provider_api_key;
+        if (direct_active != direct_source) return null;
         return .{
             .api_key = credential.token,
             .gateway_team = credential.gatewayTeam(),
@@ -1280,6 +1308,17 @@ fn takeDisplayTeam(alloc: Allocator, credential: *credentials.Credential) ?[]u8 
     const team = credential.team_id;
     credential.team_id = null;
     return team;
+}
+
+/// Number of sources the switch-credential picker can present. Sources
+/// outside `credential_source_order` (such as direct-provider keys) are not
+/// switchable and never count toward picker rows.
+fn selectableSourceCount(sources: SourceSet) usize {
+    var count: usize = 0;
+    for (credential_source_order) |source| {
+        if (sources.contains(source)) count += 1;
+    }
+    return count;
 }
 
 fn sourceAtIndex(sources: SourceSet, wanted_index: usize) ?credentials.Source {

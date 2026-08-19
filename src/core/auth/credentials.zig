@@ -140,6 +140,9 @@ pub fn catalogAccessForCredential(
                 return .{ .public_only = .fx_login_team_required };
             break :blk .fx_login;
         },
+        // Direct-provider keys never authenticate against the gateway
+        // catalog; direct providers serve their own catalogs.
+        .provider_api_key => return .{ .public_only = .no_credential },
     };
     return .{
         .authenticated = .{
@@ -284,6 +287,8 @@ pub fn loadSource(
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
+        // Resolved by the active-provider startup path, not this walk.
+        .provider_api_key => null,
     };
 }
 
@@ -295,6 +300,8 @@ pub fn sourceExists(
     return switch (source) {
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
         .ai_gateway_api_key => nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
+        // Not part of the gateway credential inventory.
+        .provider_api_key => false,
         .fx_login => blk: {
             const loaded = oauth_session.load(alloc) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -471,6 +478,7 @@ pub fn sourceLabel(source: Source) []const u8 {
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
         .fx_login => "fx login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
+        .provider_api_key => "provider API key (FX_PROVIDER)",
     };
 }
 

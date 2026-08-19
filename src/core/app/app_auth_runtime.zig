@@ -5,6 +5,7 @@ const host = @import("../hosts/host.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
+const provider_selection = @import("../config/provider_selection.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const types = @import("../shared/types.zig");
@@ -18,6 +19,19 @@ pub fn Runtime(comptime App: type) type {
     return struct {
         fn ensurePromptCredential(app: *App) !bool {
             if (app.auth.credentialSource() != null) return true;
+
+            // A direct provider authenticates with its key environment
+            // variable; the Vercel onboarding picker does not apply.
+            const active_provider = provider_selection.active();
+            if (active_provider != .gateway) {
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = provider_selection.missingKeyMessage(active_provider),
+                }, true);
+                app.shell.render_requests.request(.footer);
+                return false;
+            }
 
             const auth_view = app.auth.view();
             if (auth_view.onboarding_skipped) {
@@ -568,10 +582,13 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "session") and
                 @hasField(@TypeOf(app.session), "usage"))
             {
-                if (app.auth.gatewayCredential()) |credential| {
+                const gateway_credential = app.auth.gatewayCredential();
+                // Reconciliation talks to the Vercel generation endpoint;
+                // a direct-provider key must never be sent there.
+                if (gateway_credential != null and gateway_credential.?.source != .provider_api_key) {
                     app.session.usage.replaceReconciliationCredential(
                         app.alloc,
-                        credential.api_key,
+                        gateway_credential.?.api_key,
                     );
                 } else {
                     app.session.usage.clearReconciliationCredential();
@@ -739,6 +756,7 @@ const TestAuth = struct {
 
 const TestGatewayCredential = struct {
     api_key: []const u8,
+    source: types.CredentialSource = .ai_gateway_api_key,
 };
 
 const TestUsage = struct {

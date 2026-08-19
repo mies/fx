@@ -6,6 +6,7 @@ const app_lifecycle = @import("../app/app_lifecycle.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const provider_selection = @import("../config/provider_selection.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const background_runtime = @import("../background/background_runtime.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
@@ -1262,6 +1263,17 @@ pub fn runPromptCapture(alloc: Allocator, prompt: []const u8, auto_permission: b
 }
 
 fn missingCredentialResult(alloc: Allocator, options: RunOptions) !PromptRunResult {
+    const active_provider = provider_selection.active();
+    if (active_provider != .gateway) {
+        try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: ");
+        try options.deps.write_stderr(options.deps.stderr_ctx, provider_selection.missingKeyMessage(active_provider));
+        try options.deps.write_stderr(options.deps.stderr_ctx, "\n");
+        return .{
+            .exit_code = 1,
+            .assistant_output = try alloc.dupe(u8, ""),
+            .error_code = "MissingCredentials",
+        };
+    }
     try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: " ++ credentials.missing_credential_message ++ "\n");
     return .{
         .exit_code = 1,

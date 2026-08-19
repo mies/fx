@@ -92,6 +92,10 @@ pub const CredentialSource = enum {
     ai_gateway_api_key,
     fx_login,
     stored_key,
+    /// API key for a direct provider (FX_PROVIDER), taken from that
+    /// provider's environment variable. Not part of the gateway credential
+    /// precedence walk.
+    provider_api_key,
 };
 
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
