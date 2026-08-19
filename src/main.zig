@@ -3101,7 +3101,10 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "status") or
         std.mem.eql(u8, command, "doctor") or
         std.mem.eql(u8, command, "models") or
-        std.mem.eql(u8, command, "credits");
+        std.mem.eql(u8, command, "credits") or
+        // Codex login opens a browser, runs a loopback callback server, and
+        // exchanges tokens over the network.
+        std.mem.eql(u8, command, "codex");
 }
 
 test "auth and upgrade commands use early threaded io without full entry config" {

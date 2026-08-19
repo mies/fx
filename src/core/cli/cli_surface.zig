@@ -21,6 +21,8 @@ const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
+const codex_login = @import("../auth/codex_login.zig");
+const codex_session = @import("../auth/codex_session.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -73,6 +75,7 @@ pub const Command = union(enum) {
     upgrade: []const [:0]const u8,
     replay: []const [:0]const u8,
     workspace: []const [:0]const u8,
+    codex: []const [:0]const u8,
     unknown: []const u8,
 };
 
@@ -434,6 +437,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         },
         'c' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .credits)) return .{ .credits = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .codex)) return .{ .codex = args[1..] };
         },
         'd' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .doctor)) return .{ .doctor = args[1..] };
@@ -1357,6 +1361,9 @@ fn runNonInteractiveWithDeps(
             const exit_code = try cli_replay.run(alloc, rest);
             return if (exit_code == 0) .handled_success else .handled_failure;
         },
+        .codex => |rest| {
+            return runCodexCommand(alloc, cfg, deps, rest);
+        },
         .unknown => |command| {
             try writeStderr(deps, "fx: unknown subcommand: ");
             try writeStderr(deps, command);
@@ -1365,6 +1372,89 @@ fn runNonInteractiveWithDeps(
             return error.UnknownCliCommand;
         },
     }
+}
+
+const CodexNotifyCtx = struct {
+    deps: RunDeps,
+};
+
+fn codexNotifyUrl(raw: ?*anyopaque, url: []const u8) void {
+    const ctx: *CodexNotifyCtx = @ptrCast(@alignCast(raw.?));
+    writeStdout(ctx.deps, "Opening your browser to sign in to Codex. If it does not open, visit:\n") catch {};
+    writeStdout(ctx.deps, url) catch {};
+    writeStdout(ctx.deps, "\n") catch {};
+}
+
+fn runCodexCommand(
+    alloc: Allocator,
+    cfg: Config,
+    deps: RunDeps,
+    rest: []const [:0]const u8,
+) !RunResult {
+    const sub: []const u8 = if (rest.len == 0) "login" else rest[0];
+    if (rest.len > 1) {
+        try writeStderr(deps, "usage: fx codex [login|import|status|logout]\n");
+        return .handled_failure;
+    }
+
+    if (std.mem.eql(u8, sub, "login")) {
+        var notify_ctx = CodexNotifyCtx{ .deps = deps };
+        var session = codex_login.run(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.url_opener,
+            &notify_ctx,
+            codexNotifyUrl,
+        ) catch |err| {
+            try writeStderr(deps, switch (err) {
+                error.CodexCallbackPortBusy => "fx codex login: port 1455 is in use; close the other Codex sign-in and retry\n",
+                error.CodexBrowserOpenFailed => "fx codex login: could not open a browser; open the printed URL manually\n",
+                error.CodexStateMismatch => "fx codex login: sign-in state mismatch; run fx codex login again\n",
+                error.CodexTokenExchangeFailed => "fx codex login: the token exchange failed; run fx codex login again\n",
+                error.CodexLoginUnsupported => "fx codex login: browser login is not supported on this platform\n",
+                else => "fx codex login: sign-in failed\n",
+            });
+            return .handled_failure;
+        };
+        defer session.deinit(alloc);
+        try writeStdout(deps, "Signed in to Codex. Run with FX_PROVIDER=codex to use it.\n");
+        return .handled_success;
+    }
+    if (std.mem.eql(u8, sub, "import")) {
+        var session = (codex_session.importAny(alloc) catch null) orelse {
+            try writeStderr(deps, "fx codex import: no Codex CLI (~/.codex/auth.json) or pi (~/.pi/agent/auth.json) session found\n");
+            return .handled_failure;
+        };
+        defer session.deinit(alloc);
+        codex_session.save(alloc, session) catch {
+            try writeStderr(deps, "fx codex import: failed to save the imported session\n");
+            return .handled_failure;
+        };
+        try writeStdout(deps, "Imported an existing Codex session.\n");
+        return .handled_success;
+    }
+    if (std.mem.eql(u8, sub, "status")) {
+        if (codex_session.load(alloc) catch null) |loaded| {
+            var session = loaded;
+            defer session.deinit(alloc);
+            const line = try std.fmt.allocPrint(alloc, "Codex session present (plan: {s}).\n", .{
+                if (session.plan_type.len > 0) session.plan_type else "unknown",
+            });
+            defer alloc.free(line);
+            try writeStdout(deps, line);
+            return .handled_success;
+        }
+        try writeStdout(deps, "No Codex session. Run fx codex login or fx codex import.\n");
+        return .handled_success;
+    }
+    if (std.mem.eql(u8, sub, "logout")) {
+        const removed = codex_session.remove(alloc) catch false;
+        try writeStdout(deps, if (removed) "Removed the Codex session.\n" else "No Codex session to remove.\n");
+        return .handled_success;
+    }
+
+    try writeStderr(deps, "usage: fx codex [login|import|status|logout]\n");
+    return .handled_failure;
 }
 
 const TopLevelHelpDestination = enum { stdout, stderr };

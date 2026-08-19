@@ -11,6 +11,8 @@
 const std = @import("std");
 
 const agent_stream_provider_contract = @import("../core/agent/stream_provider.zig");
+const codex_responses = @import("../gateway/codex_responses.zig");
+const codex_session = @import("../core/auth/codex_session.zig");
 const gateway_client = @import("../gateway/client.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const generation_usage_provider = @import("../core/session/generation_usage_provider.zig");
@@ -65,6 +67,22 @@ const opencode_definition = Definition{
         .{ .id = "minimax-m3" },
         .{ .id = "gpt-5.6-luna" },
         .{ .id = "grok-4.5" },
+    },
+};
+
+/// OpenAI Codex ChatGPT subscription (Responses API). EXPERIMENTAL.
+/// Model ids track the current ChatGPT-plan Codex lineup (gpt-5.6-*); the
+/// per-account set is authoritative and can differ. Override with FX_MODEL or
+/// /model.
+const codex_definition = Definition{
+    .kind = .codex,
+    .chat_url = codex_responses.default_base_url,
+    .default_model = "gpt-5.6-sol",
+    .models = &.{
+        .{ .id = "gpt-5.6-sol", .context_window = 400_000 },
+        .{ .id = "gpt-5.6-terra", .context_window = 400_000 },
+        .{ .id = "gpt-5.6-luna", .context_window = 400_000 },
+        .{ .id = "gpt-5.5" },
     },
 };
 
@@ -123,6 +141,12 @@ pub fn overridesFor(kind: provider_selection.Kind) ?EntryOverrides {
             .default_model = opencode_definition.default_model,
             .chat_url = opencode_definition.chat_url,
         },
+        .codex => .{
+            .kind = .codex,
+            .provider = codex_provider,
+            .default_model = codex_definition.default_model,
+            .chat_url = codex_definition.chat_url,
+        },
     };
 }
 
@@ -154,12 +178,109 @@ const opencode_provider = gateway_provider.Provider{
     .model_catalog = .{ .fetch_fn = fetchOpencodeModelCatalog },
 };
 
+const codex_provider = gateway_provider.Provider{
+    .agent_stream = .{
+        .build_fn = buildCodexRequest,
+        .stream_fn = streamCodexCompletion,
+    },
+    .oauth_transport = oauth_transport.unavailable_provider,
+    .chat_url = .{ .resolve_fn = resolveCodexChatUrl },
+    .cli_model_catalog = .{ .fetch_fn = fetchCodexCliModelCatalog },
+    .credits = .{ .fetch_fn = fetchCredits },
+    .generation_usage = generation_usage_provider.unavailable_provider,
+    .web_search = unavailable_web_search_provider,
+    .model_catalog = .{ .fetch_fn = fetchCodexModelCatalog },
+};
+
 fn buildAgentRequest(
     _: ?*anyopaque,
     alloc: Allocator,
     request: agent_stream_provider_contract.BuildRequest,
 ) anyerror![]u8 {
     return openai_compat.buildChatCompletionsRequest(alloc, request);
+}
+
+fn buildCodexRequest(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    request: agent_stream_provider_contract.BuildRequest,
+) anyerror![]u8 {
+    return codex_responses.buildResponsesRequest(alloc, request);
+}
+
+fn streamCodexCompletion(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    request: agent_stream_provider_contract.Request,
+) anyerror!agent_stream_provider_contract.Result {
+    // The Codex backend requires the ChatGPT account id as a header; it is
+    // carried inside the access-token JWT, so parse it from the credential.
+    const account_id = codex_session.accountId(alloc, request.api_key) catch null;
+    defer if (account_id) |id| alloc.free(id);
+
+    const result = gateway_client.streamCodexResponses(
+        alloc,
+        .{
+            .api_key = request.api_key,
+            .codex_account_id = account_id,
+            .model = request.model,
+            .retry_count = request.retry_count,
+            .chat_url = request.chat_url,
+            .payload = request.payload,
+            .trace_ctx = request.trace_ctx,
+            .content_capture_limit = request.content_capture_limit,
+            .delivery = request.delivery,
+            .on_reasoning_chunk = request.on_reasoning_chunk,
+            .on_tool_input_chunk = request.on_tool_input_chunk,
+            .provider_attempt_owner = switch (request.provider_attempt_owner) {
+                .transport => .transport,
+                .agent => .agent,
+            },
+        },
+        request.callback_ctx,
+        request.on_content_chunk,
+        request.on_tool_start,
+        request.cancel_flag,
+    ) catch |err| {
+        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
+            err,
+            request.delivery.load(),
+        );
+        return err;
+    };
+    return .{
+        .status = result.status,
+        .completion = result.completion,
+        .err_body = result.err_body,
+        .generation_origin = "",
+        .reconcile_generation_usage = false,
+        .retry_after_seconds = result.retry_after_seconds,
+        .ownership = .owned,
+    };
+}
+
+fn resolveCodexChatUrl(_: ?*anyopaque, fallback: []const u8) []const u8 {
+    _ = fallback;
+    return codex_definition.chat_url;
+}
+
+fn fetchCodexModelCatalog(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+    input: model_catalog.FetchInput,
+) Allocator.Error!model_catalog.ProviderResult {
+    _ = raw;
+    _ = input;
+    return syntheticCatalog(alloc, codex_definition);
+}
+
+fn fetchCodexCliModelCatalog(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+    input: gateway_provider.CliModelCatalogInput,
+) gateway_provider.CliModelCatalogResult {
+    _ = raw;
+    return cliCatalog(alloc, codex_definition, input);
 }
 
 fn streamAgentCompletion(

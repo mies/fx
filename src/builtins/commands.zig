@@ -259,6 +259,23 @@ pub const top_level_specs = [_]TopLevelSpec{
             "Additional directories are stored for the current primary workspace.",
         },
     },
+    .{
+        .kind = .codex,
+        .token = "codex",
+        .usage = "codex [login|import|status|logout]",
+        .summary = "Manage an OpenAI Codex ChatGPT subscription session (experimental)",
+        .options = &.{
+            .{ .flag = "login", .description = "Sign in with ChatGPT in the browser (default)" },
+            .{ .flag = "import", .description = "Adopt an existing Codex CLI or pi login" },
+            .{ .flag = "status", .description = "Show the stored Codex session" },
+            .{ .flag = "logout", .description = "Remove the stored Codex session" },
+        },
+        .details = &.{
+            "Experimental, personal use: fx signs in as the Codex client to your own ChatGPT subscription.",
+            "Run with FX_PROVIDER=codex to use the session for model requests.",
+        },
+        .hidden_from_top_level_help = true,
+    },
 };
 
 pub const top_level_help_default_width = command_specs.top_level_help_default_width;

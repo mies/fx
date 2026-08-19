@@ -12,7 +12,16 @@ pub const Kind = enum {
     gateway,
     zai,
     opencode,
+    /// OpenAI Codex ChatGPT subscription (OAuth, not a static key).
+    /// EXPERIMENTAL / personal use; see src/core/auth/codex_session.zig.
+    codex,
 };
+
+/// Direct providers that authenticate with a static API key. Codex is a direct
+/// provider too but uses an OAuth session instead of a key env var.
+pub fn usesApiKey(kind: Kind) bool {
+    return apiKeyEnvVar(kind) != null;
+}
 
 pub fn parse(text: []const u8) ?Kind {
     return std.meta.stringToEnum(Kind, text);
@@ -32,7 +41,7 @@ pub fn active() Kind {
 /// The gateway resolves credentials through the auth runtime instead.
 pub fn apiKeyEnvVar(kind: Kind) ?[]const u8 {
     return switch (kind) {
-        .gateway => null,
+        .gateway, .codex => null,
         .zai => "ZAI_API_KEY",
         .opencode => "OPENCODE_API_KEY",
     };
@@ -44,6 +53,7 @@ pub fn missingKeyMessage(kind: Kind) []const u8 {
         .gateway => "Fx needs access to Vercel AI Gateway.",
         .zai => "FX_PROVIDER=zai is set but no Z.AI key was found. Set ZAI_API_KEY, add a \"zai\" entry to ~/.fx/provider-keys.json (valid JSON, chmod 600), or unset FX_PROVIDER to use the Vercel AI Gateway.",
         .opencode => "FX_PROVIDER=opencode is set but no OpenCode key was found. Set OPENCODE_API_KEY, add an \"opencode\" entry to ~/.fx/provider-keys.json (valid JSON, chmod 600), or unset FX_PROVIDER to use the Vercel AI Gateway.",
+        .codex => "FX_PROVIDER=codex is set but no Codex session was found. Run `fx codex login` (or `fx codex import`), or unset FX_PROVIDER to use the Vercel AI Gateway.",
     };
 }
 
@@ -52,6 +62,7 @@ pub fn label(kind: Kind) []const u8 {
         .gateway => "Vercel AI Gateway",
         .zai => "Z.AI",
         .opencode => "OpenCode",
+        .codex => "OpenAI Codex (ChatGPT)",
     };
 }
 

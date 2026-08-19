@@ -79,6 +79,20 @@ FX_PROVIDER=opencode fx
 
 Any other `FX_PROVIDER` value falls back to the gateway. While a direct provider is active, gateway-only features degrade gracefully: web search, vision, credits, usage reconciliation, and automatic permission review are unavailable, and auto permission mode prompts instead of reviewing. `fx login` and gateway API keys are ignored for streaming while `FX_PROVIDER` is set.
 
+#### OpenAI Codex (ChatGPT subscription) — experimental
+
+`FX_PROVIDER=codex` uses your own ChatGPT subscription through OpenAI's Codex backend. This is **experimental and for personal use**: fx signs in as the Codex client to an undocumented endpoint, which OpenAI does not sanction for third-party tools — use it only with your own subscription, never for shared or commercial access.
+
+```bash
+fx codex login       # sign in with ChatGPT in the browser (localhost:1455 callback)
+fx codex import       # or adopt an existing Codex CLI / pi login
+fx codex status       # show the stored session
+fx codex logout       # remove it
+FX_PROVIDER=codex fx  # use it
+```
+
+If the official Codex CLI is already signed in, fx adopts that session automatically on first use. Available models are per-account (recent ChatGPT plans serve the `gpt-5.6-*` line); set one with `FX_MODEL` or `/model` if the default is not offered.
+
 Inside a saved session, `/permissions remember <allow|deny> <tool-name> <arguments-json>` stores an exact confirmed rule without running the action. `/permissions` lists stable rule IDs, and `/permissions revoke <rule-id>` removes a stored rule even when its original workspace or file state has changed.
 
 ## Embed fx

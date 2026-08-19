@@ -7,6 +7,7 @@ const credentials = @import("../auth/credentials.zig");
 const host = @import("../hosts/host.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const input_appearance = @import("../config/input_appearance.zig");
+const codex_session = @import("../auth/codex_session.zig");
 const provider_key_file = @import("../auth/provider_key_file.zig");
 const provider_selection = @import("../config/provider_selection.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -362,8 +363,14 @@ fn loadStartupStateForWorkspace(alloc: Allocator, workspace_root: []const u8, de
 
 const CredentialLoadMode = credentials.LoadMode;
 
-fn directProviderCredential(alloc: Allocator) !?credentials.Credential {
+fn directProviderCredential(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    mode: CredentialLoadMode,
+) !?credentials.Credential {
     const kind = provider_selection.active();
+    if (kind == .codex) return codexProviderCredential(alloc, transport, mode);
+
     const env_name = provider_selection.apiKeyEnvVar(kind) orelse return null;
     if (io_mod.getenv(env_name)) |raw| {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
@@ -377,6 +384,44 @@ fn directProviderCredential(alloc: Allocator) !?credentials.Credential {
             .token = key,
             .source = .provider_api_key,
         };
+    }
+    return null;
+}
+
+fn codexProviderCredential(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    mode: CredentialLoadMode,
+) !?credentials.Credential {
+    var session = (try loadOrImportCodexSession(alloc, transport, mode)) orelse return null;
+    defer session.deinit(alloc);
+    return .{
+        .token = try alloc.dupe(u8, session.access_token),
+        .source = .provider_api_key,
+    };
+}
+
+fn loadOrImportCodexSession(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    mode: CredentialLoadMode,
+) !?codex_session.Session {
+    // `.stored` mode (diagnostics) must not refresh: refreshing performs
+    // network I/O and rewrites the session file.
+    switch (mode) {
+        .stored => {
+            if (codex_session.load(alloc) catch null) |session| return session;
+        },
+        .refresh_if_needed => {
+            if (codex_session.loadValid(alloc, transport) catch null) |session| return session;
+        },
+    }
+    // No fx session yet: adopt an existing Codex CLI / pi login if present so
+    // the provider works out of the box for users already signed in.
+    if (codex_session.importAny(alloc) catch null) |imported| {
+        const owned = imported;
+        codex_session.save(alloc, owned) catch {};
+        return owned;
     }
     return null;
 }
@@ -421,11 +466,10 @@ fn loadStartupStateFromOwnedWorkspace(
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
     if (credential_mode) |mode| {
         if (provider_selection.active() != .gateway) {
-            // A direct provider (FX_PROVIDER) authenticates with its own API
-            // key environment variable; the gateway credential walk does not
-            // apply. A missing key leaves the credential unset so the
-            // existing missing-credential surfaces report it.
-            state.credential = try directProviderCredential(alloc);
+            // A direct provider (FX_PROVIDER) authenticates with its own key
+            // or OAuth session; the gateway credential walk does not apply. A
+            // missing credential leaves it unset so existing surfaces report it.
+            state.credential = try directProviderCredential(alloc, transport, mode);
         } else {
             const resolution = try credentials.resolvePreferring(alloc, transport, secret_store, mode, settings.credential_source);
             state.credential = resolution.credential;

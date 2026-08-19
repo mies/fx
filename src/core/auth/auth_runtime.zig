@@ -4,6 +4,7 @@ const credentials = @import("credentials.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("login_flow.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const codex_session = @import("codex_session.zig");
 const provider_key_file = @import("provider_key_file.zig");
 const provider_selection = @import("../config/provider_selection.zig");
 const secret = @import("secret.zig");
@@ -530,6 +531,20 @@ pub fn loadStatusSnapshot(
     // environment variable; the gateway credential walk does not describe it.
     const active_provider = provider_selection.active();
     if (active_provider != .gateway) {
+        if (active_provider == .codex) {
+            // Diagnostics only: load without refresh (no network / no rewrite).
+            if (codex_session.load(alloc) catch null) |loaded| {
+                var session = loaded;
+                session.deinit(alloc);
+                return .{ .active_source = .provider_api_key };
+            }
+            if (codex_session.importAny(alloc) catch null) |imported| {
+                var session = imported;
+                session.deinit(alloc);
+                return .{ .active_source = .provider_api_key };
+            }
+            return .{};
+        }
         if (provider_selection.apiKeyEnvVar(active_provider)) |env_name| {
             if (io_mod.getenv(env_name)) |raw| {
                 if (std.mem.trim(u8, raw, " \t\r\n").len > 0) {

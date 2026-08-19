@@ -767,6 +767,8 @@ const RequestOpenOverride = struct {
 pub const StreamProtocol = enum {
     gateway,
     openai_chat,
+    /// OpenAI Codex ChatGPT-subscription Responses API.
+    codex,
 };
 
 const StreamCoreOptions = struct {
@@ -1005,6 +1007,8 @@ pub const StreamRequest = struct {
     chat_url: []const u8,
     payload: []const u8,
     team: ?[]const u8 = null,
+    /// Codex only: ChatGPT account id sent as the `chatgpt-account-id` header.
+    codex_account_id: ?[]const u8 = null,
     /// Borrowed until `streamGatewayCompletion` returns.
     session_id: ?[]const u8 = null,
     trace_ctx: debug_trace.TraceContext = .{},
@@ -1060,6 +1064,228 @@ pub fn streamOpenAiChatCompletion(
         true,
         .{ .protocol = .openai_chat },
     );
+}
+
+/// Streams one Codex ChatGPT-subscription Responses request. EXPERIMENTAL.
+pub fn streamCodexResponses(
+    alloc: std.mem.Allocator,
+    request: StreamRequest,
+    callback_ctx: *anyopaque,
+    on_content_chunk: StreamCallback,
+    on_tool_start: ?ToolStartCallback,
+    cancel_flag: *std.atomic.Value(bool),
+) !StreamResult {
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    return streamGatewayCompletionCoreWithOptions(
+        alloc,
+        request,
+        callback_ctx,
+        on_content_chunk,
+        on_tool_start,
+        cancel_flag,
+        null,
+        true,
+        .{ .protocol = .codex },
+    );
+}
+
+fn codexExtraHeaders(buf: []std.http.Header, account_id: ?[]const u8) []const std.http.Header {
+    std.debug.assert(buf.len >= 4);
+    var len: usize = 0;
+    if (account_id) |id| {
+        buf[len] = .{ .name = "chatgpt-account-id", .value = id };
+        len += 1;
+    }
+    buf[len] = .{ .name = "originator", .value = "codex_cli_rs" };
+    len += 1;
+    buf[len] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
+    len += 1;
+    buf[len] = .{ .name = "Accept", .value = "text/event-stream" };
+    len += 1;
+    return buf[0..len];
+}
+
+const CodexItem = struct {
+    call_id: std.ArrayList(u8) = .empty,
+    name: std.ArrayList(u8) = .empty,
+    arguments: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *CodexItem, alloc: std.mem.Allocator) void {
+        self.call_id.deinit(alloc);
+        self.name.deinit(alloc);
+        self.arguments.deinit(alloc);
+    }
+};
+
+/// Consumes the Codex Responses SSE stream. Events are keyed by their JSON
+/// `type`; text arrives on `response.output_text.delta`, tool calls are read
+/// from authoritative `response.output_item.done` function_call items, and the
+/// stream terminates on `response.completed`/`response.failed`/
+/// `response.incomplete`.
+fn consumeCodexResponsesSse(
+    alloc: std.mem.Allocator,
+    reader: anytype,
+    callback_ctx: *anyopaque,
+    on_content_chunk: StreamCallback,
+    on_tool_start: ?ToolStartCallback,
+    on_reasoning_chunk: ?StreamCallback,
+    on_tool_input_chunk: ?StreamCallback,
+    cancel_flag: *std.atomic.Value(bool),
+    content_capture_limit: ?usize,
+) !types.GatewayCompletion {
+    var content_buf: std.ArrayList(u8) = .empty;
+    defer content_buf.deinit(alloc);
+    var tool_calls: std.ArrayList(types.ToolCall) = .empty;
+    errdefer {
+        for (tool_calls.items) |call| types.freeToolCall(alloc, call);
+        tool_calls.deinit(alloc);
+    }
+    var usage: types.Usage = .{};
+    var finish_reason: ?types.ProviderFinishReason = null;
+    var failure_detail: ?[]u8 = null;
+    errdefer if (failure_detail) |detail| alloc.free(detail);
+
+    var event_reader = SseEventReader{ .max_line_bytes = max_sse_event_line_bytes };
+    defer event_reader.deinit(alloc);
+
+    while (true) {
+        if (cancel_flag.load(.seq_cst)) break;
+        const event = try event_reader.next(alloc, reader);
+        defer event_reader.releaseLine();
+        const json_text = switch (event) {
+            .data => |t| t,
+            .done => break,
+            .ignored => continue,
+            .read_failed => {
+                if (cancel_flag.load(.seq_cst)) break;
+                return error.ReadFailed;
+            },
+            .eof => break,
+        };
+
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            traceMalformedSseEvent(json_text.len);
+            continue;
+        };
+        defer parsed.deinit();
+        const root = parsed.value;
+        if (root != .object) continue;
+        const type_val = root.object.get("type") orelse continue;
+        if (type_val != .string) continue;
+        const event_type = type_val.string;
+
+        if (std.mem.eql(u8, event_type, "response.output_text.delta")) {
+            if (stringField(root.object, "delta")) |delta| {
+                if (delta.len > 0) {
+                    on_content_chunk(callback_ctx, delta);
+                    try appendCappedOpenAiContent(alloc, &content_buf, delta, content_capture_limit);
+                }
+            }
+        } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta") or
+            std.mem.eql(u8, event_type, "response.reasoning_text.delta"))
+        {
+            if (stringField(root.object, "delta")) |delta| {
+                if (on_reasoning_chunk) |cb| cb(callback_ctx, delta);
+            }
+        } else if (std.mem.eql(u8, event_type, "response.output_item.added")) {
+            if (root.object.get("item")) |item| {
+                if (item == .object and isFunctionCallItem(item.object)) {
+                    const name = stringField(item.object, "name") orelse "";
+                    const call_id = stringField(item.object, "call_id") orelse "";
+                    if (on_tool_start) |cb| cb(callback_ctx, call_id, name, null);
+                }
+            }
+        } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
+            if (stringField(root.object, "delta")) |delta| {
+                if (on_tool_input_chunk) |cb| cb(callback_ctx, delta);
+            }
+        } else if (std.mem.eql(u8, event_type, "response.output_item.done")) {
+            if (root.object.get("item")) |item| {
+                if (item == .object and isFunctionCallItem(item.object)) {
+                    try appendCodexToolCall(alloc, &tool_calls, item.object);
+                }
+            }
+        } else if (std.mem.eql(u8, event_type, "response.completed")) {
+            if (root.object.get("response")) |resp| {
+                if (resp == .object) readCodexUsage(resp.object, &usage);
+            }
+            break;
+        } else if (std.mem.eql(u8, event_type, "response.failed") or
+            std.mem.eql(u8, event_type, "response.incomplete") or
+            std.mem.eql(u8, event_type, "error"))
+        {
+            finish_reason = if (std.mem.eql(u8, event_type, "response.incomplete")) .length else .provider_error;
+            if (failure_detail == null) {
+                failure_detail = codexFailureDetail(alloc, root.object) catch null;
+            }
+            break;
+        }
+    }
+
+    var completion = types.GatewayCompletion{ .usage = usage };
+    completion.tool_calls = try tool_calls.toOwnedSlice(alloc);
+    if (content_buf.items.len > 0) {
+        completion.content = content_buf.toOwnedSlice(alloc) catch |err| {
+            types.freeToolCallSlice(alloc, @constCast(completion.tool_calls));
+            return err;
+        };
+    }
+    if (finish_reason == null) {
+        finish_reason = if (completion.tool_calls.len > 0) .tool_calls else .stop;
+    }
+    completion.finish_reason = finish_reason;
+    completion.provider_failure_detail = failure_detail;
+    failure_detail = null;
+    return completion;
+}
+
+fn isFunctionCallItem(item: std.json.ObjectMap) bool {
+    const t = item.get("type") orelse return false;
+    return t == .string and std.mem.eql(u8, t.string, "function_call");
+}
+
+fn appendCodexToolCall(
+    alloc: std.mem.Allocator,
+    tool_calls: *std.ArrayList(types.ToolCall),
+    item: std.json.ObjectMap,
+) !void {
+    const call_id_src = stringField(item, "call_id") orelse stringField(item, "id") orelse return;
+    const name_src = stringField(item, "name") orelse "";
+    const args_src = stringField(item, "arguments") orelse "{}";
+
+    const id = try alloc.dupe(u8, call_id_src);
+    errdefer alloc.free(id);
+    const name = try alloc.dupe(u8, name_src);
+    errdefer alloc.free(name);
+    const arguments = try alloc.dupe(u8, if (args_src.len > 0) args_src else "{}");
+    errdefer alloc.free(arguments);
+    try tool_calls.append(alloc, .{
+        .id = id,
+        .name = name,
+        .arguments_json = arguments,
+        .argument_integrity = try types.ToolArgumentIntegrity.classifySerialized(alloc, arguments),
+    });
+}
+
+fn readCodexUsage(response: std.json.ObjectMap, usage: *types.Usage) void {
+    const usage_val = response.get("usage") orelse return;
+    if (usage_val != .object) return;
+    if (jsonUnsignedField(usage_val.object.get("input_tokens"))) |v| usage.input_tokens = v;
+    if (jsonUnsignedField(usage_val.object.get("output_tokens"))) |v| usage.output_tokens = v;
+}
+
+fn codexFailureDetail(alloc: std.mem.Allocator, root: std.json.ObjectMap) !?[]u8 {
+    const response = root.get("response") orelse {
+        if (stringField(root, "message")) |msg| return try alloc.dupe(u8, msg);
+        return null;
+    };
+    if (response != .object) return null;
+    const err = response.object.get("error") orelse return null;
+    if (err != .object) return null;
+    const code = stringField(err.object, "code") orelse "";
+    const message = stringField(err.object, "message") orelse "";
+    return try std.fmt.allocPrint(alloc, "{s}: {s}", .{ code, message });
 }
 
 const OpenAiToolAccumulator = struct {
@@ -1235,6 +1461,12 @@ fn allToolArgumentsValid(calls: []const types.ToolCall) bool {
         if (call.argument_integrity != .valid) return false;
     }
     return true;
+}
+
+fn stringField(root: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = root.get(key) orelse return null;
+    if (v != .string) return null;
+    return v.string;
 }
 
 fn jsonUnsignedField(value: ?std.json.Value) ?u64 {
@@ -1715,6 +1947,9 @@ fn streamGatewayCompletionCoreWithOptions(
         // content-type, and user-agent; gateway routing headers would leak
         // request identity to a third-party host.
         .openai_chat => extra_headers_buf[0..0],
+        // Codex ChatGPT backend: account id + Codex client identity + SSE
+        // accept. No gateway routing headers.
+        .codex => codexExtraHeaders(&extra_headers_buf, request.codex_account_id),
     };
 
     var attempt: usize = 0;
@@ -1934,6 +2169,17 @@ fn streamGatewayCompletionCoreWithOptions(
                 request.content_capture_limit,
             ),
             .openai_chat => consumeOpenAiChatSse(
+                alloc,
+                body_reader,
+                callback_ctx,
+                on_content_chunk,
+                on_tool_start,
+                request.on_reasoning_chunk,
+                request.on_tool_input_chunk,
+                cancel_flag,
+                request.content_capture_limit,
+            ),
+            .codex => consumeCodexResponsesSse(
                 alloc,
                 body_reader,
                 callback_ctx,
