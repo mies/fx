@@ -15,6 +15,13 @@ const chromeCandidates = [
   "google-chrome",
   "chromium",
 ].filter(Boolean);
+const chromeStartTimeoutMs = 15_000;
+
+async function stopChrome(process) {
+  if (process.exitCode !== null || process.signalCode !== null) return;
+  process.kill();
+  await new Promise((resolveExit) => process.once("exit", resolveExit));
+}
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -60,7 +67,7 @@ for (const candidate of chromeCandidates) {
       };
       const timeout = setTimeout(() => fail(new Error(
         `timed out starting ${candidate}${stderr.trim() ? `: ${stderr.trim()}` : ""}`,
-      )), 5000);
+      )), chromeStartTimeoutMs);
       chrome.once("error", fail);
       chrome.once("exit", (code, signal) => fail(new Error(
         `${candidate} exited before DevTools started (${signal || code})${stderr.trim() ? `: ${stderr.trim()}` : ""}`,
@@ -78,7 +85,7 @@ for (const candidate of chromeCandidates) {
     break;
   } catch (error) {
     chromeLaunchError = error;
-    chrome?.kill();
+    if (chrome) await stopChrome(chrome);
     chrome = null;
   }
 }
@@ -199,6 +206,6 @@ try {
   }
 } finally {
   socket.close();
-  chrome.kill();
+  await stopChrome(chrome);
   server.close();
 }

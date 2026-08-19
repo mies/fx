@@ -390,6 +390,45 @@ describe("fx ask presentation", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "memory list is presented as a read-only tool call",
+    async () => {
+      const root = createRoot();
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("memory_list", "memory", { action: "list" }),
+        fakeGatewayFinalText("Memory list complete.\n"),
+      ]);
+      gateways.push(gateway);
+
+      const session = await TmuxSession.create({
+        cmd: terminalCommand([
+          "ask",
+          "--auto",
+          "--no-save",
+          "List saved memories.",
+        ]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 120,
+        height: 40,
+        remainOnExit: true,
+        stderrPath,
+      });
+      sessions.push(session);
+
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const pane = await session.captureFullScrollback();
+      expect(pane).toContain("● 1 tool call · 1 read");
+      expect(pane).toContain("Listing memories");
+      expect(pane).not.toContain("1 write");
+      expect(pane).not.toContain("Remembered list");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "--no-color keeps the TTY layout without Fx styles or hyperlinks",
     async () => {
       const root = createRoot();

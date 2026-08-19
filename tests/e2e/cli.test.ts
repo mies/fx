@@ -4143,6 +4143,147 @@ describe("cli: ask success", () => {
     180_000,
   );
 
+  test(
+    "saved ask survives session cache contention and repairs after release",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-cache-contention-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const lockReady = join(root, "latest-lock-ready");
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("first saved turn"),
+        fakeGatewayFinalText("contended exact turn"),
+        fakeGatewayFinalText("contended latest turn"),
+        fakeGatewayFinalText("repairing turn"),
+      ]);
+      let lockHolder: ReturnType<typeof Bun.spawn> | null = null;
+      try {
+        mkdirSync(home);
+        mkdirSync(workspace);
+        const workspaceRoot = realpathSync(workspace);
+        const env = {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "fake-session-cache-contention-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+        };
+
+        const first = await runFx(
+          ["ask", "--json", "--auto", "Reply with the first saved turn."],
+          { cwd: workspaceRoot, env, timeoutMs: 60_000 },
+        );
+        expect(first.code).toBe(0);
+        expect(first.stderr).toBe("");
+        const sessionId = JSON.parse(first.stdout).session_id as string;
+        const lockPath = join(home, ".fx", "sessions", "latest.lock");
+        lockHolder = Bun.spawn(
+          [
+            "python3",
+            "-c",
+            [
+              "import fcntl, os, sys, time",
+              "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)",
+              "fcntl.flock(fd, fcntl.LOCK_EX)",
+              "open(sys.argv[2], 'w').close()",
+              "time.sleep(300)",
+            ].join("\n"),
+            lockPath,
+            lockReady,
+          ],
+          { stdout: "ignore", stderr: "pipe" },
+        );
+        for (let attempt = 0; attempt < 250 && !existsSync(lockReady); attempt += 1) {
+          await Bun.sleep(20);
+        }
+        expect(existsSync(lockReady)).toBe(true);
+
+        const exact = await runFx(
+          [
+            "ask",
+            "--json",
+            "--auto",
+            "--resume-id",
+            sessionId,
+            "Reply with the contended exact turn.",
+          ],
+          { cwd: workspaceRoot, env, timeoutMs: 60_000 },
+        );
+        expect(exact.code).toBe(0);
+        expect(exact.stderr).toBe("");
+        expect(JSON.parse(exact.stdout).output.trim()).toBe("contended exact turn");
+        const tokenPath = join(
+          home,
+          ".fx",
+          "sessions",
+          "latest",
+          "deferred",
+          sessionId,
+        );
+        expect(existsSync(tokenPath)).toBe(true);
+
+        const listed = await runFx(["sessions", "--json"], {
+          cwd: workspaceRoot,
+          env: { HOME: home, ...NO_GATEWAY_AUTH },
+          timeoutMs: 60_000,
+        });
+        expect(listed.code).toBe(0);
+        expect(listed.stderr).toBe("");
+        expect(JSON.parse(listed.stdout).sessions[0]).toMatchObject({
+          id: sessionId,
+          history_len: 2,
+        });
+
+        const latest = await runFx(
+          [
+            "ask",
+            "--json",
+            "--auto",
+            "--resume",
+            "last",
+            "Reply with the contended latest turn.",
+          ],
+          { cwd: workspaceRoot, env, timeoutMs: 60_000 },
+        );
+        expect(latest.code).toBe(0);
+        expect(latest.stderr).toBe("");
+        expect(JSON.parse(latest.stdout).session_id).toBe(sessionId);
+        expect(JSON.parse(latest.stdout).output.trim()).toBe("contended latest turn");
+
+        lockHolder.kill();
+        await lockHolder.exited;
+        lockHolder = null;
+        const repaired = await runFx(
+          [
+            "ask",
+            "--json",
+            "--auto",
+            "--resume-id",
+            sessionId,
+            "Reply with the repairing turn.",
+          ],
+          { cwd: workspaceRoot, env, timeoutMs: 60_000 },
+        );
+        expect(repaired.code).toBe(0);
+        expect(repaired.stderr).toBe("");
+        expect(JSON.parse(repaired.stdout).output.trim()).toBe("repairing turn");
+        expect(existsSync(tokenPath)).toBe(false);
+        expect(gateway.requests).toHaveLength(4);
+      } finally {
+        if (lockHolder) {
+          lockHolder.kill();
+          await lockHolder.exited;
+        }
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    300_000,
+  );
+
   test.skipIf(!HAS_API_KEY)(
     "fx ask --json --no-save --auto returns valid JSON with output",
     async () => {

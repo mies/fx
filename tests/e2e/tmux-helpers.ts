@@ -585,6 +585,13 @@ export class TmuxSession {
       : [
         ";",
         "set-option",
+        "-w",
+        "-t",
+        `${name}:0`,
+        "history-limit",
+        String(Math.max(serverHistoryLines!, minimumHistoryLines)),
+        ";",
+        "set-option",
         "-g",
         "history-limit",
         String(serverHistoryLines!),

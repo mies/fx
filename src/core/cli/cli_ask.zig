@@ -106,22 +106,38 @@ const supports_headless_interrupt = switch (std_builtin.os.tag) {
 
 const HeadlessInterruptInstallError = error{HeadlessInterruptBusy};
 const headless_interrupt_exit_code: u8 = 130;
+const headless_termination_exit_code: u8 = 143;
 
 const headless_interrupt = if (supports_headless_interrupt) struct {
     var coordinator_mutex: std.Io.Mutex = .init;
     var coordinator_active = false;
     var cancel_requested = std.atomic.Value(bool).init(false);
+    var requested_signal = std.atomic.Value(u8).init(0);
     var test_after_reset_before_install: if (std_builtin.is_test) ?*const fn () void else void =
         if (std_builtin.is_test) null else {};
     var test_after_restore: if (std_builtin.is_test) ?*const fn () void else void =
         if (std_builtin.is_test) null else {};
 
-    fn handle(_: std.posix.SIG) callconv(.c) void {
+    fn handle(signal: std.posix.SIG) callconv(.c) void {
+        _ = requested_signal.cmpxchgStrong(
+            0,
+            @intCast(@intFromEnum(signal)),
+            .seq_cst,
+            .seq_cst,
+        );
         cancel_requested.store(true, .seq_cst);
     }
 
+    fn exitCode() u8 {
+        return switch (@as(std.posix.SIG, @enumFromInt(requested_signal.load(.seq_cst)))) {
+            std.posix.SIG.TERM => headless_termination_exit_code,
+            else => headless_interrupt_exit_code,
+        };
+    }
+
     const Scope = struct {
-        old_action: std.posix.Sigaction = undefined,
+        old_sigint_action: std.posix.Sigaction = undefined,
+        old_sigterm_action: std.posix.Sigaction = undefined,
         installed: bool = false,
 
         fn install(enabled: bool) HeadlessInterruptInstallError!Scope {
@@ -136,11 +152,13 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
                 .flags = 0,
             };
             var scope = Scope{};
+            requested_signal.store(0, .seq_cst);
             cancel_requested.store(false, .seq_cst);
             if (std_builtin.is_test) {
                 if (test_after_reset_before_install) |hook| hook();
             }
-            std.posix.sigaction(std.posix.SIG.INT, &action, &scope.old_action);
+            std.posix.sigaction(std.posix.SIG.INT, &action, &scope.old_sigint_action);
+            std.posix.sigaction(std.posix.SIG.TERM, &action, &scope.old_sigterm_action);
             coordinator_active = true;
             scope.installed = true;
             return scope;
@@ -151,12 +169,14 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
             coordinator_mutex.lockUncancelable(io_mod.getIo());
             defer coordinator_mutex.unlock(io_mod.getIo());
             std.debug.assert(coordinator_active);
-            std.posix.sigaction(std.posix.SIG.INT, &self.old_action, null);
+            std.posix.sigaction(std.posix.SIG.INT, &self.old_sigint_action, null);
+            std.posix.sigaction(std.posix.SIG.TERM, &self.old_sigterm_action, null);
             if (std_builtin.is_test) {
                 if (test_after_restore) |hook| hook();
             }
             if (redeliver and cancel_requested.load(.seq_cst)) {
-                _ = std.c.raise(std.posix.SIG.INT);
+                const signal: std.posix.SIG = @enumFromInt(requested_signal.load(.seq_cst));
+                _ = std.c.raise(signal);
             }
             coordinator_active = false;
             self.installed = false;
@@ -175,6 +195,10 @@ const headless_interrupt = if (supports_headless_interrupt) struct {
         }
     };
 } else struct {
+    fn exitCode() u8 {
+        return headless_interrupt_exit_code;
+    }
+
     const Scope = struct {
         fn install(_: bool) HeadlessInterruptInstallError!Scope {
             return .{};
@@ -884,6 +908,7 @@ const AskContext = struct {
             .subagent_caller_id = if (self.writable) |*writable| writable.active_id else null,
             .auto_classifier = self.admissionAutoClassifier(),
             .worker = &self.worker,
+            .cancel_flag = self.cancelFlag(),
             .background = &self.background,
             .session = &self.session,
             .session_allocator = self.alloc,
@@ -1132,13 +1157,13 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
     };
     defer options.deinit(alloc);
 
-    if (interrupt_scope.requested()) return headless_interrupt_exit_code;
+    if (interrupt_scope.requested()) return headless_interrupt.exitCode();
     if (options.image_paths.items.len > 0) {
         const workspace_root = try io_mod.realpathAlloc(alloc, ".");
         defer alloc.free(workspace_root);
         if (!try preflightAskImages(alloc, workspace_root, &options, deps)) return 1;
     }
-    if (interrupt_scope.requested()) return headless_interrupt_exit_code;
+    if (interrupt_scope.requested()) return headless_interrupt.exitCode();
 
     var effective_cfg = cfg;
     if (options.system_prompt_override) |sp| {
@@ -1161,7 +1186,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         .continue_recovery = options.continue_recovery,
         .deps = deps,
     }) catch |err| {
-        if (interrupt_scope.requested()) return headless_interrupt_exit_code;
+        if (interrupt_scope.requested()) return headless_interrupt.exitCode();
         if (err == error.OutOfMemory) return err;
         if (err == error.OneOffSessionNotResumable and !options.json_output) {
             try deps.write_stderr(
@@ -1179,18 +1204,18 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
     defer result.deinit(alloc);
 
     if (result.interrupted or interrupt_scope.requested()) {
-        return headless_interrupt_exit_code;
+        return headless_interrupt.exitCode();
     }
 
     if (options.json_output) {
         const json = try renderFinalJsonResult(alloc, result);
         defer alloc.free(json);
-        if (interrupt_scope.requested()) return headless_interrupt_exit_code;
+        if (interrupt_scope.requested()) return headless_interrupt.exitCode();
         try deps.write_stdout(deps.stdout_ctx, json);
     }
 
     return if (interrupt_scope.requested())
-        headless_interrupt_exit_code
+        headless_interrupt.exitCode()
     else
         result.exit_code;
 }

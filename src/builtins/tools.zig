@@ -189,8 +189,8 @@ const terminal_properties = [_]gateway_schema.Property{
     .{ .name = "after_event_id", .json_type = .integer },
     .{ .name = "acknowledge_event_id", .json_type = .integer, .minimum = 1 },
     .{ .name = "max_events", .json_type = .integer, .minimum = 1, .maximum = 256 },
-    .{ .name = "write", .json_type = .object, .object_schema = &terminal_write_schema },
-    .{ .name = "lease", .json_type = .string, .enum_values = &.{ "acquire", "use", "release", "revoke" } },
+    .{ .name = "write", .json_type = .object, .object_schema = &terminal_write_schema, .description = "Payload is valid only with lease=use. Set null for acquire, release, and revoke." },
+    .{ .name = "lease", .json_type = .string, .enum_values = &.{ "acquire", "use", "release", "revoke" }, .description = "Use lease=acquire without write, then send a second call with lease=use and the payload. Release and revoke also require write=null." },
     .{ .name = "monitor", .json_type = .object, .object_schema = &terminal_monitor_operation_schema },
     .{ .name = "task_id", .json_type = .string },
     .{ .name = "workspace_root", .json_type = .string },
@@ -748,6 +748,7 @@ pub const memory = ToolSpec{
     .completed_action_label = "Remembered",
     .label_arg_kind = .action,
     .label_arg_default = "memory",
+    .presentation_fn = memory_impl.presentation,
     .permission_target_kind = .none,
     .decode = memory_impl.decode,
     .validate = memory_impl.validate,
@@ -1338,6 +1339,14 @@ test "terminal tool schema exposes one nullable object backed by the terminal ac
     try std.testing.expectEqualStrings(
         "Required for session-targeted actions. Set null for start and list; owner-catalog authority is private.",
         schemaProperty(input_schema, "session_id").?.description,
+    );
+    try std.testing.expectEqualStrings(
+        "Payload is valid only with lease=use. Set null for acquire, release, and revoke.",
+        schemaProperty(input_schema, "write").?.description,
+    );
+    try std.testing.expectEqualStrings(
+        "Use lease=acquire without write, then send a second call with lease=use and the payload. Release and revoke also require write=null.",
+        schemaProperty(input_schema, "lease").?.description,
     );
     try std.testing.expectEqualStrings(
         "Startup profile for exec or start; omission defaults to user, while clean skips user startup files. User-profile execution supports the configured Bash or zsh login shell. Bash login execution reads login startup files; .bashrc is available only when sourced by the login profile. For start, an explicit shell is used instead of the default profile and is mutually exclusive with profile.",
@@ -2005,11 +2014,40 @@ test "built-in memory owns product metadata schema and callbacks" {
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, memory.permission_target_kind);
     try std.testing.expectEqualStrings("Remembering", memory.action_label);
     try std.testing.expectEqualStrings("Remembered", memory.completed_action_label);
+    try std.testing.expect(memory.presentation_fn.? == memory_impl.presentation);
     try std.testing.expect(memory.decode == memory_impl.decode);
     try std.testing.expect(memory.validate.? == memory_impl.validate);
     try std.testing.expect(memory.call == memory_impl.call);
     try std.testing.expect(memory.reads_only_fn == memory_impl.readsOnly);
     try std.testing.expect(memory.irreversible_fn == memory_impl.isIrreversible);
+
+    const list_call = types.ToolCall{
+        .id = "memory_list",
+        .name = "memory",
+        .arguments_json = "{\"action\":\"list\"}",
+    };
+    const save_call = types.ToolCall{
+        .id = "memory_save",
+        .name = "memory",
+        .arguments_json = "{\"action\":\"save\",\"fact\":\"test\"}",
+    };
+    const clear_call = types.ToolCall{
+        .id = "memory_clear",
+        .name = "memory",
+        .arguments_json = "{\"action\":\"clear\"}",
+    };
+    try std.testing.expectEqual(
+        types.ToolActivityKind.read,
+        tool_dispatch.toolActivityKindForCall(std.testing.allocator, registry, list_call),
+    );
+    try std.testing.expectEqual(
+        types.ToolActivityKind.write,
+        tool_dispatch.toolActivityKindForCall(std.testing.allocator, registry, save_call),
+    );
+    try std.testing.expectEqual(
+        types.ToolActivityKind.write,
+        tool_dispatch.toolActivityKindForCall(std.testing.allocator, registry, clear_call),
+    );
 }
 
 test "built-in semantic_search owns product metadata schema and callbacks" {

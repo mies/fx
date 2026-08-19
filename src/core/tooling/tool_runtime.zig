@@ -3262,6 +3262,15 @@ fn runCommandArgsForTest(alloc: Allocator, command: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
+fn runCommandArgsWithCleanProfileForTest(alloc: Allocator, command: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"action\":\"exec\",\"command\":");
+    try std.json.Stringify.value(command, .{}, &out.writer);
+    try out.writer.writeAll(",\"profile\":\"clean\"}");
+    return out.toOwnedSlice();
+}
+
 fn executeTestRunCommand(
     ctx: Context,
     arena: Allocator,
@@ -6427,7 +6436,7 @@ test "run_command reactive sandbox retry timeout retains both attempts" {
         "printf 'FIRST-ATTEMPT\\n'; printf x > '{s}' || exit 1; printf 'RETRY-ATTEMPT\\n'; sleep 5",
         .{marker},
     );
-    const args = try runCommandArgsForTest(arena, command);
+    const args = try runCommandArgsWithCleanProfileForTest(arena, command);
 
     var rt = TestRuntime{
         .workspace_root = workspace,

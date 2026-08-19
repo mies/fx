@@ -1708,6 +1708,30 @@ fn requiresResolvedRequestCapabilities(
         (fast_mode and !available.supports_fast_mode);
 }
 
+fn request_max_output_tokens(capabilities: model_capabilities.Capabilities) ?u32 {
+    const max_output_tokens = capabilities.max_output_tokens orelse return null;
+    const context_window = capabilities.context_window orelse return max_output_tokens;
+    if (max_output_tokens >= context_window) return null;
+    return max_output_tokens;
+}
+
+test "request output limit follows capability bounds" {
+    const cases = [_]struct {
+        capabilities: model_capabilities.Capabilities,
+        expected: ?u32,
+    }{
+        .{ .capabilities = .{}, .expected = null },
+        .{ .capabilities = .{ .max_output_tokens = 32_000 }, .expected = 32_000 },
+        .{ .capabilities = .{ .context_window = 256_000 }, .expected = null },
+        .{ .capabilities = .{ .context_window = 256_000, .max_output_tokens = 32_000 }, .expected = 32_000 },
+        .{ .capabilities = .{ .context_window = 1_048_576, .max_output_tokens = 1_048_576 }, .expected = null },
+        .{ .capabilities = .{ .context_window = 128_000, .max_output_tokens = 256_000 }, .expected = null },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, request_max_output_tokens(case.capabilities));
+    }
+}
+
 fn processQueuedPromptInner(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
@@ -2621,7 +2645,7 @@ fn processQueuedPromptLoop(
                         selected_dynamic_tool_schemas.items,
                     .vision_mode = vision_mode,
                     .provider_options = provider_opts,
-                    .max_output_tokens = request_capabilities.max_output_tokens,
+                    .max_output_tokens = request_max_output_tokens(request_capabilities),
                     .budget = .{ .cancel_flag = config.cancel_flag },
                 },
             ) catch |err| {
@@ -3844,7 +3868,7 @@ fn processQueuedPromptLoop(
         }
         var step_has_visible_tool_calls = false;
         for (completion.tool_calls) |call| {
-            if (runtime_tool_presentation.activityKind(deps.tool_registry, call.name) == .ask) continue;
+            if (runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, call) == .ask) continue;
             step_has_visible_tool_calls = true;
             break;
         }
@@ -4447,7 +4471,7 @@ fn processQueuedPromptLoop(
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
         if (step_has_content) {
             const first_tool_is_ask = effective_tool_calls.len > 0 and
-                runtime_tool_presentation.activityKind(deps.tool_registry, effective_tool_calls[0].name) == .ask;
+                runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, effective_tool_calls[0]) == .ask;
             if (!first_tool_is_ask) try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
             silent_tool_steps = 0;
         } else {
@@ -6074,7 +6098,7 @@ fn processQueuedPromptLoop(
                 };
             }
             const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = execution_call.id };
-            const execution_is_command = runtime_tool_presentation.activityKind(deps.tool_registry, tool_call.name) == .command;
+            const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
             var sandbox_widening_feedback: ?[]const u8 = null;
             var sandbox_widening_required: ?runtime_tool_contracts.SandboxScopeRequired = null;
             var sandbox_widening_retry_started = false;
