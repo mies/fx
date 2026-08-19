@@ -1176,6 +1176,29 @@ pub const Runtime = struct {
         return self.adoptCredential(alloc, &credential);
     }
 
+    /// Refreshes the active Codex OAuth token before a prompt when it is at or
+    /// near expiry, rotating and persisting the session and adopting the fresh
+    /// access token. No-op unless FX_PROVIDER=codex and the token needs it.
+    pub fn refreshCodexIfNeeded(self: *Self, alloc: Allocator) !bool {
+        if (provider_selection.active() != .codex) return false;
+        const credential = self.selected_credential orelse return false;
+        if (credential.source != .provider_api_key) return false;
+        if (!credential.needsRefreshAt(io_mod.milliTimestamp())) return false;
+
+        var session = (codex_session.loadValid(alloc, self.oauth_transport) catch {
+            return error.CredentialRefreshUnavailable;
+        }) orelse return error.CredentialRefreshUnavailable;
+        defer session.deinit(alloc);
+
+        var refreshed = credentials.Credential{
+            .token = try alloc.dupe(u8, session.access_token),
+            .source = .provider_api_key,
+            .refresh_after_ms = session.expires_at_ms,
+        };
+        defer refreshed.deinit(alloc);
+        return self.adoptCredential(alloc, &refreshed);
+    }
+
     /// Drops the current selection and re-runs precedence after the user clears
     /// a remembered credential source.
     pub fn reselectByPrecedence(self: *Self, alloc: Allocator) !bool {

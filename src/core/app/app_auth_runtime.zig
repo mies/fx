@@ -532,6 +532,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn preparePromptCredential(app: *App) !bool {
+            if (provider_selection.active() == .codex) return prepareCodexPromptCredential(app);
             for (0..2) |_| {
                 refreshFxLoginCredentialIfNeeded(app) catch |err| switch (err) {
                     error.OutOfMemory => return err,
@@ -540,6 +541,29 @@ pub fn Runtime(comptime App: type) type {
                 if (app.auth.gatewayCredential() != null) return true;
             }
             return recoverPromptCredentialRefreshFailure(app, error.CredentialRefreshUnavailable);
+        }
+
+        fn prepareCodexPromptCredential(app: *App) !bool {
+            _ = app.auth.refreshCodexIfNeeded(app.alloc) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    // The token expired and could not be renewed; surface a
+                    // clear re-login prompt instead of a cryptic 401.
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Your Codex session expired and could not be refreshed. Run `fx codex login` again.",
+                    }, true);
+                    return false;
+                },
+            };
+            if (app.auth.gatewayCredential() != null) return true;
+            try app.writeDomainNotice(.{
+                .topic = "auth",
+                .tone = .@"error",
+                .body = "Your Codex session expired. Run `fx codex login` again.",
+            }, true);
+            return false;
         }
 
         fn recoverPromptCredentialRefreshFailure(app: *App, err: anyerror) !bool {
@@ -705,6 +729,12 @@ const TestAuth = struct {
         if (self.refresh_error) |err| return err;
         if (self.gateway_ready_after_refresh_count == self.refresh_count) self.gateway_ready = true;
         return self.refresh_changed;
+    }
+
+    // The codex refresh path is only reached when FX_PROVIDER=codex, which the
+    // fake tests never set; the stub exists so the mixin type-checks.
+    fn refreshCodexIfNeeded(_: *TestAuth, _: std.mem.Allocator) !bool {
+        return false;
     }
 
     fn gatewayCredential(self: *const TestAuth) ?TestGatewayCredential {
